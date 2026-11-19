@@ -102,6 +102,16 @@ async def init_personal_db() -> None:
                 """
             )
         )
+        await conn.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS hidden_items (
+                    item_id INTEGER PRIMARY KEY,
+                    is_hidden INTEGER NOT NULL DEFAULT 1
+                )
+                """
+            )
+        )
 
 
 async def init_db() -> None:

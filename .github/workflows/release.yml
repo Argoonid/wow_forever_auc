@@ -1,0 +1,85 @@
+name: Build & Publish Windows Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Тег релиза (например v1.0.0)'
+        required: true
+        default: 'v1.0.0'
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies & PyInstaller
+        run: |
+          pip install -r requirements.txt
+          pip install pyinstaller pystray pillow
+
+      - name: Generate app.ico (golden coin + green arrow)
+        shell: pwsh
+        run: |
+          python -c "
+          from PIL import Image, ImageDraw
+          img = Image.new('RGBA', (256, 256), (18, 20, 26, 0))
+          d = ImageDraw.Draw(img)
+          d.ellipse((16, 16, 240, 240), fill=(234, 179, 8, 255), outline=(254, 240, 138, 255), width=8)
+          d.ellipse((34, 34, 222, 222), fill=(217, 158, 6, 255), outline=(161, 112, 4, 255), width=4)
+          d.rectangle((112, 112, 144, 184), fill=(34, 197, 94, 255), outline=(20, 83, 45, 255), width=4)
+          d.polygon([(128, 64), (70, 124), (186, 124)], fill=(34, 197, 94, 255), outline=(20, 83, 45, 255))
+          img.save('app.ico', format='ICO', sizes=[(256,256),(128,128),(64,64),(48,48),(32,32),(16,16)])
+          "
+
+      - name: Build ForeverTerminal.exe
+        shell: pwsh
+        run: |
+          pyinstaller --noconfirm --onedir --windowed `
+            --name "ForeverTerminal" `
+            --icon "app.ico" `
+            --add-data "static;static" `
+            --hidden-import "asyncpg.pgproto.pgproto" `
+            --hidden-import "aiosqlite" `
+            --hidden-import "sqlalchemy.dialects.postgresql.asyncpg" `
+            --hidden-import "sqlalchemy.dialects.sqlite.aiosqlite" `
+            --hidden-import "uvicorn.logging" `
+            --hidden-import "uvicorn.loops.auto" `
+            --hidden-import "uvicorn.protocols.http.auto" `
+            --hidden-import "uvicorn.lifespan.on" `
+            desktop_app.py
+
+      - name: Inject read-only .env and package ZIP
+        shell: pwsh
+        env:
+          READER_DATABASE_URL: ${{ secrets.READER_DATABASE_URL }}
+        run: |
+          @"
+          MARKET_DATABASE_URL=$env:READER_DATABASE_URL
+          PERSONAL_DATABASE_URL=sqlite+aiosqlite:///./personal.db
+          MARKET_READ_ONLY=true
+          "@ | Out-File -FilePath "dist/ForeverTerminal/.env" -Encoding utf8 -NoNewline
+          Compress-Archive -Path "dist/ForeverTerminal/*" -DestinationPath "ForeverTerminal-win64.zip" -Force
+
+      - name: Publish GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ inputs.version }}"
+          $notes = "Распакуй архив в любую папку и запусти **ForeverTerminal.exe**. Личный портфель и радар сохраняются рядом в ``personal.db``."
+          gh release view $tag 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag ForeverTerminal-win64.zip --clobber
+          } else {
+            gh release create $tag ForeverTerminal-win64.zip --title "WoW Forever Terminal $tag" --notes $notes
+          }

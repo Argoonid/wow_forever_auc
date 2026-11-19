@@ -1,4 +1,6 @@
 import json
+import mimetypes
+import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from fastapi import FastAPI, Query
@@ -13,7 +15,7 @@ from analyzer import (
     get_scored_opportunities,
 )
 from config import settings
-from database import async_session_factory, init_db
+from database import async_session_factory, init_db, personal_session_factory
 from models import ChartDrawing, ItemMeta, MarketTick, TradePosition
 from portfolio import (
     create_buy_position,
@@ -27,14 +29,14 @@ from portfolio import (
     reset_burned_deposit,
 )
 
-import mimetypes
-
+# Перекрываем баг реестра Windows, отдающего .js как text/plain
 mimetypes.add_type("application/javascript", ".js")
 mimetypes.add_type("application/javascript", ".mjs")
 mimetypes.add_type("text/css", ".css")
 
 app = FastAPI(title="WoW Forever Terminal")
-STATIC_DIR = Path(__file__).parent / "static"
+BASE_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
+STATIC_DIR = BASE_DIR / "static"
 STATIC_DIR.mkdir(exist_ok=True)
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
@@ -77,26 +79,6 @@ class WatchlistPayload(BaseModel):
     note: str = ""
 
 
-async def _ensure_watchlist_table() -> None:
-    async with async_session_factory() as session:
-        await session.execute(
-            text(
-                """
-                CREATE TABLE IF NOT EXISTS watchlist_items (
-                    item_id INTEGER PRIMARY KEY,
-                    bucket TEXT NOT NULL DEFAULT 'watch',
-                    added_price_copper INTEGER NOT NULL DEFAULT 0,
-                    target_buy_copper INTEGER NOT NULL DEFAULT 0,
-                    target_sell_copper INTEGER NOT NULL DEFAULT 0,
-                    note TEXT NOT NULL DEFAULT '',
-                    created_at TEXT NOT NULL
-                )
-                """
-            )
-        )
-        await session.commit()
-
-
 async def _get_latest_price_map(session) -> dict[int, dict]:
     latest_id_subq = (
         select(MarketTick.item_id, func.max(MarketTick.id).label("max_id"))
@@ -113,10 +95,15 @@ async def _get_latest_price_map(session) -> dict[int, dict]:
     }
 
 
+async def _get_local_hidden_map() -> dict[int, bool]:
+    async with personal_session_factory() as psession:
+        rows = (await psession.execute(text("SELECT item_id, is_hidden FROM hidden_items"))).all()
+    return {int(iid): bool(flag) for iid, flag in rows}
+
+
 @app.on_event("startup")
 async def on_startup() -> None:
     await init_db()
-    await _ensure_watchlist_table()
 
 
 @app.get("/")
@@ -126,80 +113,105 @@ async def index_page():
 
 @app.get("/api/items")
 async def api_items(min_price: int = Query(80, ge=0)):
-    async with async_session_factory() as session:
+    async with async_session_factory() as msession:
         stmt = select(ItemMeta).order_by(
             desc(ItemMeta.is_active_pool), desc(ItemMeta.velocity_score), asc(ItemMeta.name)
         )
-        rows = (await session.execute(stmt)).scalars().all()
-        latest_map = await _get_latest_price_map(session)
+        rows = (await msession.execute(stmt)).scalars().all()
+        latest_map = await _get_latest_price_map(msession)
 
-        # Защищаем от скрытия предметы, которые уже в портфеле или на радаре
+    async with personal_session_factory() as psession:
         pf_ids = {
             r[0]
             for r in (
-                await session.execute(
+                await psession.execute(
                     select(TradePosition.item_id).where(TradePosition.status.in_(("holding", "listed")))
                 )
             ).all()
         }
         wl_ids = {
-            int(r[0]) for r in (await session.execute(text("SELECT item_id FROM watchlist_items"))).all()
+            int(r[0]) for r in (await psession.execute(text("SELECT item_id FROM watchlist_items"))).all()
         }
-        protected_ids = pf_ids | wl_ids
+        hidden_rows = (await psession.execute(text("SELECT item_id, is_hidden FROM hidden_items"))).all()
 
-        out = []
-        for r in rows:
-            latest = latest_map.get(r.item_id, {})
-            last_price = latest.get("price", 0)
-            last_qty = latest.get("qty", 0)
-            effective_price = last_price if last_price > 0 else (r.tsm_market_value or 0)
+    local_hidden = {int(iid): bool(flag) for iid, flag in hidden_rows}
+    protected_ids = pf_ids | wl_ids
 
-            if min_price > 0 and effective_price > 0 and effective_price < min_price and r.item_id not in protected_ids:
-                continue
+    out = []
+    for r in rows:
+        latest = latest_map.get(r.item_id, {})
+        last_price = latest.get("price", 0)
+        last_qty = latest.get("qty", 0)
+        effective_price = last_price if last_price > 0 else (r.tsm_market_value or 0)
 
-            out.append({
-                "item_id": r.item_id,
-                "name": r.name,
-                "icon": r.icon_name or "inv_misc_questionmark",
-                "category": r.category,
-                "is_active_pool": r.is_active_pool,
-                "is_hidden": bool(r.is_hidden),
-                "velocity_score": round(r.velocity_score, 1),
-                "market_value": r.tsm_market_value,
-                "last_price": last_price,
-                "effective_price": effective_price,
-                "last_qty": last_qty,
-                "vendor_price": r.vendor_sell_price,
-                "max_stack": r.max_stack,
-            })
-        return out
+        if min_price > 0 and effective_price > 0 and effective_price < min_price and r.item_id not in protected_ids:
+            continue
+
+        is_hidden = local_hidden[r.item_id] if r.item_id in local_hidden else bool(r.is_hidden)
+        out.append({
+            "item_id": r.item_id,
+            "name": r.name,
+            "icon": r.icon_name or "inv_misc_questionmark",
+            "category": r.category,
+            "is_active_pool": r.is_active_pool,
+            "is_hidden": is_hidden,
+            "velocity_score": round(r.velocity_score, 1),
+            "market_value": r.tsm_market_value,
+            "last_price": last_price,
+            "effective_price": effective_price,
+            "last_qty": last_qty,
+            "vendor_price": r.vendor_sell_price,
+            "max_stack": r.max_stack,
+        })
+    return out
 
 
 @app.post("/api/items/{item_id}/toggle-hide")
 async def api_toggle_hide(item_id: int):
-    async with async_session_factory() as session:
-        item = await session.get(ItemMeta, item_id)
+    async with async_session_factory() as msession:
+        item = await msession.get(ItemMeta, item_id)
         if not item:
             return {"error": "not found"}
-        item.is_hidden = not bool(item.is_hidden)
-        await session.commit()
-        return {"item_id": item_id, "is_hidden": item.is_hidden}
+        cloud_hidden = bool(item.is_hidden)
+
+    async with personal_session_factory() as psession:
+        row = (
+            await psession.execute(
+                text("SELECT is_hidden FROM hidden_items WHERE item_id = :iid"),
+                {"iid": item_id},
+            )
+        ).first()
+        current_hidden = bool(row[0]) if row is not None else cloud_hidden
+        new_hidden = not current_hidden
+
+        await psession.execute(
+            text(
+                "INSERT INTO hidden_items (item_id, is_hidden) VALUES (:iid, :val) "
+                "ON CONFLICT(item_id) DO UPDATE SET is_hidden = :val"
+            ),
+            {"iid": item_id, "val": 1 if new_hidden else 0},
+        )
+        await psession.commit()
+    return {"item_id": item_id, "is_hidden": new_hidden}
 
 
 @app.get("/api/opportunities")
 async def api_opportunities(min_price: int = Query(80, ge=0)):
     ops = await get_scored_opportunities()
-    async with async_session_factory() as session:
+    async with async_session_factory() as msession:
         meta_map = {
-            r.item_id: r for r in (await session.execute(select(ItemMeta))).scalars().all()
+            r.item_id: r for r in (await msession.execute(select(ItemMeta))).scalars().all()
         }
+    local_hidden = await _get_local_hidden_map()
+
     filtered = []
     for op in ops:
         if min_price > 0 and op.get("buy", 0) < min_price:
             continue
-        m = meta_map.get(op["item_id"])
+        iid = op["item_id"]
+        m = meta_map.get(iid)
         op["icon"] = (m.icon_name if m else None) or "inv_misc_questionmark"
-        op["is_hidden"] = bool(m.is_hidden) if m else False
+        op["is_hidden"] = local_hidden[iid] if iid in local_hidden else (bool(m.is_hidden) if m else False)
         op["buy_fmt"] = format_wow_money(op["buy"])
         op["sell_fmt"] = format_wow_money(op["sell"])
         op["profit_fmt"] = format_wow_money(op["total_profit"])
@@ -219,7 +231,6 @@ async def api_calls_digest():
 
 
 def _build_dip_forecast(ticks: list[MarketTick], base_price_silver: float) -> list[dict]:
-    # Не рисуем синтетический 24ч прогноз, если у товара меньше 3 реальных срезов
     if base_price_silver <= 0 or len(ticks) < 3:
         return []
 
@@ -251,14 +262,12 @@ def _build_dip_forecast(ticks: list[MarketTick], base_price_silver: float) -> li
         emp_list = by_hour.get(h, [])
         weight_emp = min(1.0, len(emp_list) / 3.0)
         emp_mult = (sum(emp_list) / len(emp_list)) / anchor if emp_list else prior_hourly[h]
-        # Ограничиваем выбросы эмпирического множителя, чтобы график не улетал в аномалии
         emp_mult = max(0.55, min(1.65, emp_mult))
         blended_mult = (1.0 - weight_emp) * prior_hourly[h] + weight_emp * emp_mult
 
-        expected_price = round(anchor * blended_mult, 2)
         forecast_points.append({
             "time": int(future_dt.timestamp()),
-            "value": expected_price,
+            "value": round(anchor * blended_mult, 2),
             "is_dip": blended_mult <= 0.94,
         })
 
@@ -267,7 +276,7 @@ def _build_dip_forecast(ticks: list[MarketTick], base_price_silver: float) -> li
 
 @app.get("/api/history/{item_id}")
 async def api_history(item_id: int, days: int = Query(0, ge=0, le=90)):
-    async with async_session_factory() as session:
+    async with async_session_factory() as msession:
         stmt = select(MarketTick).where(
             MarketTick.item_id == item_id,
             MarketTick.entry_price > 0,
@@ -276,8 +285,8 @@ async def api_history(item_id: int, days: int = Query(0, ge=0, le=90)):
             cutoff = datetime.now(timezone.utc) - timedelta(days=days)
             stmt = stmt.where(MarketTick.snapshot_ts >= cutoff)
         stmt = stmt.order_by(asc(MarketTick.snapshot_ts), asc(MarketTick.id))
-        ticks = list((await session.execute(stmt)).scalars().all())
-        meta = await session.get(ItemMeta, item_id)
+        ticks = list((await msession.execute(stmt)).scalars().all())
+        meta = await msession.get(ItemMeta, item_id)
 
     max_gap_sec = settings.MAX_CONTINUOUS_GAP_MINUTES * 60
     sessions: list[dict] = []
@@ -300,7 +309,6 @@ async def api_history(item_id: int, days: int = Query(0, ge=0, le=90)):
         price_silver = round(t.entry_price / 100.0, 2)
         market_silver = round(t.market_value / 100.0, 2) if t.market_value > 0 else 0.0
 
-        # Защита от дублей timestamp (иначе LightweightCharts ломает рендер линии)
         if prev_unix is not None and unix_sec == prev_unix:
             if current_session["line"]:
                 current_session["line"][-1] = {"time": unix_sec, "value": price_silver}
@@ -322,7 +330,6 @@ async def api_history(item_id: int, days: int = Query(0, ge=0, le=90)):
             })
 
         current_session["line"].append({"time": unix_sec, "value": price_silver})
-        # Не добавляем нулевые market_value, чтобы не сплющивать ось Y к нулю
         if market_silver > 0:
             current_session["market_line"].append({"time": unix_sec, "value": market_silver})
         prev_unix = unix_sec
@@ -354,11 +361,13 @@ async def api_history(item_id: int, days: int = Query(0, ge=0, le=90)):
     }
 
 
+# === РАЗМЕТКА ГРАФИКОВ (personal.db) ===
+
 @app.get("/api/drawings/{item_id}")
 async def get_drawings(item_id: int):
-    async with async_session_factory() as session:
+    async with personal_session_factory() as psession:
         stmt = select(ChartDrawing).where(ChartDrawing.item_id == item_id).order_by(asc(ChartDrawing.id))
-        rows = (await session.execute(stmt)).scalars().all()
+        rows = (await psession.execute(stmt)).scalars().all()
         return [
             {
                 "id": r.id,
@@ -373,42 +382,47 @@ async def get_drawings(item_id: int):
 
 @app.post("/api/drawings")
 async def save_drawing(payload: DrawingPayload):
-    async with async_session_factory() as session:
+    async with personal_session_factory() as psession:
         rec = ChartDrawing(
             item_id=payload.item_id,
             tool_type=payload.tool_type,
             points_json=json.dumps(payload.points),
             note_text=payload.note_text.strip(),
         )
-        session.add(rec)
-        await session.commit()
-        await session.refresh(rec)
+        psession.add(rec)
+        await psession.commit()
+        await psession.refresh(rec)
         return {"id": rec.id, "status": "ok"}
 
 
 @app.delete("/api/drawings/{item_id}")
 async def clear_drawings(item_id: int):
-    async with async_session_factory() as session:
-        await session.execute(delete(ChartDrawing).where(ChartDrawing.item_id == item_id))
-        await session.commit()
+    async with personal_session_factory() as psession:
+        await psession.execute(delete(ChartDrawing).where(ChartDrawing.item_id == item_id))
+        await psession.commit()
         return {"status": "cleared"}
 
 
-
+# === РАДАР / ИНВЕСТ (personal.db + цены из Neon) ===
 
 @app.get("/api/watchlist")
 async def api_watchlist_list():
-    async with async_session_factory() as session:
+    async with personal_session_factory() as psession:
         rows = (
-            await session.execute(
+            await psession.execute(
                 text(
                     "SELECT item_id, bucket, added_price_copper, target_buy_copper, target_sell_copper, note, created_at "
                     "FROM watchlist_items ORDER BY created_at DESC"
                 )
             )
         ).all()
-        meta_map = {r.item_id: r for r in (await session.execute(select(ItemMeta))).scalars().all()}
-        latest_map = await _get_latest_price_map(session)
+
+    if not rows:
+        return []
+
+    async with async_session_factory() as msession:
+        meta_map = {r.item_id: r for r in (await msession.execute(select(ItemMeta))).scalars().all()}
+        latest_map = await _get_latest_price_map(msession)
 
     items = []
     for iid, bucket, added_p, t_buy, t_sell, note, created_at in rows:
@@ -417,8 +431,6 @@ async def api_watchlist_list():
         curr_price = latest.get("price", 0) or (meta.tsm_market_value if meta else 0)
         curr_qty = latest.get("qty", 0)
         delta_pct = round(((curr_price - added_p) / added_p) * 100.0, 1) if (added_p > 0 and curr_price > 0) else 0.0
-        in_buy_zone = bool(t_buy > 0 and curr_price > 0 and curr_price <= t_buy)
-        in_sell_zone = bool(t_sell > 0 and curr_price > 0 and curr_price >= t_sell)
 
         items.append({
             "item_id": iid,
@@ -431,8 +443,8 @@ async def api_watchlist_list():
             "delta_pct": delta_pct,
             "target_buy": t_buy,
             "target_sell": t_sell,
-            "in_buy_zone": in_buy_zone,
-            "in_sell_zone": in_sell_zone,
+            "in_buy_zone": bool(t_buy > 0 and curr_price > 0 and curr_price <= t_buy),
+            "in_sell_zone": bool(t_sell > 0 and curr_price > 0 and curr_price >= t_sell),
             "velocity": round(meta.velocity_score, 1) if meta else 0.0,
             "note": note or "",
             "created_at": created_at,
@@ -445,16 +457,16 @@ async def api_watchlist_upsert(payload: WatchlistPayload):
     bucket = payload.bucket if payload.bucket in VALID_BUCKETS else "watch"
     now_iso = datetime.now(timezone.utc).isoformat()
 
-    async with async_session_factory() as session:
+    async with personal_session_factory() as psession:
         existing = (
-            await session.execute(
+            await psession.execute(
                 text("SELECT added_price_copper FROM watchlist_items WHERE item_id = :iid"),
                 {"iid": payload.item_id},
             )
         ).first()
 
         if existing:
-            await session.execute(
+            await psession.execute(
                 text(
                     "UPDATE watchlist_items "
                     "SET bucket = :b, target_buy_copper = :tb, target_sell_copper = :ts, note = :n "
@@ -469,10 +481,12 @@ async def api_watchlist_upsert(payload: WatchlistPayload):
                 },
             )
         else:
-            latest_map = await _get_latest_price_map(session)
-            meta = await session.get(ItemMeta, payload.item_id)
-            curr_p = latest_map.get(payload.item_id, {}).get("price", 0) or (meta.tsm_market_value if meta else 0)
-            await session.execute(
+            async with async_session_factory() as msession:
+                latest_map = await _get_latest_price_map(msession)
+                meta = await msession.get(ItemMeta, payload.item_id)
+                curr_p = latest_map.get(payload.item_id, {}).get("price", 0) or (meta.tsm_market_value if meta else 0)
+
+            await psession.execute(
                 text(
                     "INSERT INTO watchlist_items "
                     "(item_id, bucket, added_price_copper, target_buy_copper, target_sell_copper, note, created_at) "
@@ -488,19 +502,19 @@ async def api_watchlist_upsert(payload: WatchlistPayload):
                     "ca": now_iso,
                 },
             )
-        await session.commit()
+        await psession.commit()
     return {"status": "ok", "item_id": payload.item_id, "bucket": bucket}
 
 
 @app.delete("/api/watchlist/{item_id}")
 async def api_watchlist_delete(item_id: int):
-    async with async_session_factory() as session:
-        await session.execute(text("DELETE FROM watchlist_items WHERE item_id = :iid"), {"iid": item_id})
-        await session.commit()
+    async with personal_session_factory() as psession:
+        await psession.execute(text("DELETE FROM watchlist_items WHERE item_id = :iid"), {"iid": item_id})
+        await psession.commit()
     return {"status": "deleted"}
 
 
-
+# === ПОРТФЕЛЬ ===
 
 @app.get("/api/portfolio")
 async def api_portfolio():
@@ -557,3 +571,29 @@ async def api_portfolio_vendor(pos_id: int):
 @app.delete("/api/portfolio/{pos_id}")
 async def api_portfolio_delete(pos_id: int):
     return await delete_position(pos_id=pos_id)
+
+
+# === СВЯЗКА С ТРЕЕМ (АВТОВЫХОД ПРИ ЗАКРЫТИИ БРАУЗЕРА) ===
+
+_lifecycle_hooks: dict[str, object] = {}
+
+
+def register_lifecycle_hooks(on_ping, on_closing) -> None:
+    _lifecycle_hooks["ping"] = on_ping
+    _lifecycle_hooks["closing"] = on_closing
+
+
+@app.post("/api/lifecycle/ping")
+async def api_lifecycle_ping():
+    fn = _lifecycle_hooks.get("ping")
+    if callable(fn):
+        fn()
+    return {"status": "alive"}
+
+
+@app.post("/api/lifecycle/closing")
+async def api_lifecycle_closing():
+    fn = _lifecycle_hooks.get("closing")
+    if callable(fn):
+        fn()
+    return {"status": "closing_scheduled"}

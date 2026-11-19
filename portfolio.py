@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
-from sqlalchemy import desc, select
-from database import async_session_factory
+from sqlalchemy import desc, func, select
+from database import async_session_factory, personal_session_factory
 from models import ItemMeta, MarketTick, TradePosition
 
 
@@ -12,6 +12,13 @@ def calc_wow_deposit(vendor_unit_copper: int, qty: int, hours: int = 8) -> int:
     return max(1, int(vendor_unit_copper * qty * rate))
 
 
+def _to_unix(dt: datetime | None) -> int:
+    if not dt:
+        return 0
+    aware = dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    return int(aware.timestamp())
+
+
 async def create_buy_position(
     item_id: int,
     qty: int,
@@ -21,19 +28,21 @@ async def create_buy_position(
     deposit_hours: int = 8,
 ) -> dict:
     now = datetime.now(timezone.utc)
-    async with async_session_factory() as session:
-        meta = await session.get(ItemMeta, item_id)
+
+    async with async_session_factory() as msession:
+        meta = await msession.get(ItemMeta, item_id)
         vendor_unit = meta.vendor_sell_price if meta else 0
 
-        status = "holding"
-        active_deposit = 0
-        listed_at = None
+    status = "holding"
+    active_deposit = 0
+    listed_at = None
 
-        if list_price_copper > 0:
-            status = "listed"
-            active_deposit = calc_wow_deposit(vendor_unit, qty, deposit_hours)
-            listed_at = now
+    if list_price_copper > 0:
+        status = "listed"
+        active_deposit = calc_wow_deposit(vendor_unit, qty, deposit_hours)
+        listed_at = now
 
+    async with personal_session_factory() as psession:
         pos = TradePosition(
             item_id=item_id,
             qty=qty,
@@ -48,9 +57,9 @@ async def create_buy_position(
             bought_at=now,
             listed_at=listed_at,
         )
-        session.add(pos)
-        await session.commit()
-        await session.refresh(pos)
+        psession.add(pos)
+        await psession.commit()
+        await psession.refresh(pos)
         return {"id": pos.id, "status": pos.status, "deposit": pos.active_deposit_copper}
 
 
@@ -62,8 +71,8 @@ async def list_position_on_ah(
     custom_deposit_copper: int | None = None,
 ) -> dict:
     now = datetime.now(timezone.utc)
-    async with async_session_factory() as session:
-        pos = await session.get(TradePosition, pos_id)
+    async with personal_session_factory() as psession:
+        pos = await psession.get(TradePosition, pos_id)
         if not pos or pos.status not in ("holding", "listed"):
             return {"error": "Позиция недоступна для выставления"}
 
@@ -81,18 +90,18 @@ async def list_position_on_ah(
         pos.active_deposit_copper = max(0, dep)
         pos.status = "listed"
         pos.listed_at = now
-        await session.commit()
+        await psession.commit()
         return {"id": pos.id, "status": "listed", "deposit": pos.active_deposit_copper}
 
 
 async def reset_burned_deposit(pos_id: int) -> dict:
     """Обнуляет ошибочно начисленный сгоревший залог на активной позиции."""
-    async with async_session_factory() as session:
-        pos = await session.get(TradePosition, pos_id)
+    async with personal_session_factory() as psession:
+        pos = await psession.get(TradePosition, pos_id)
         if not pos:
             return {"error": "Позиция не найдена"}
         pos.burned_deposit_copper = 0
-        await session.commit()
+        await psession.commit()
         return {"status": "ok"}
 
 
@@ -103,8 +112,8 @@ async def mark_position_sold(
 ) -> dict:
     """Фиксация продажи: возврат активного залога, вычет 5% комиссии аукциона и сгоревших залогов."""
     now = datetime.now(timezone.utc)
-    async with async_session_factory() as session:
-        pos = await session.get(TradePosition, pos_id)
+    async with personal_session_factory() as psession:
+        pos = await psession.get(TradePosition, pos_id)
         if not pos or pos.status not in ("holding", "listed"):
             return {"error": "Позиция уже закрыта"}
 
@@ -153,16 +162,16 @@ async def mark_position_sold(
                 listed_at=pos.listed_at,
                 closed_at=now,
             )
-            session.add(sold_part)
+            psession.add(sold_part)
 
-        await session.commit()
+        await psession.commit()
         return {"status": "sold", "net_pnl": net_pnl, "ah_fee": ah_fee, "returned_deposit": active_dep_share}
 
 
 async def mark_position_expired(pos_id: int) -> dict:
     """Лот не купили: залог сгорает, предмет возвращается в сумку (holding)."""
-    async with async_session_factory() as session:
-        pos = await session.get(TradePosition, pos_id)
+    async with personal_session_factory() as psession:
+        pos = await psession.get(TradePosition, pos_id)
         if not pos or pos.status != "listed":
             return {"error": "Лот не находится на аукционе"}
 
@@ -171,15 +180,15 @@ async def mark_position_expired(pos_id: int) -> dict:
         pos.active_deposit_copper = 0
         pos.list_price_copper = 0
         pos.status = "holding"
-        await session.commit()
+        await psession.commit()
         return {"status": "holding", "burned_now": burned, "total_burned": pos.burned_deposit_copper}
 
 
 async def mark_position_vendored(pos_id: int) -> dict:
     """Закрытие позиции сдачей торговцу (без 5% комиссии АН, с учётом сгоревших залогов)."""
     now = datetime.now(timezone.utc)
-    async with async_session_factory() as session:
-        pos = await session.get(TradePosition, pos_id)
+    async with personal_session_factory() as psession:
+        pos = await psession.get(TradePosition, pos_id)
         if not pos or pos.status not in ("holding", "listed"):
             return {"error": "Позиция уже закрыта"}
 
@@ -196,37 +205,50 @@ async def mark_position_vendored(pos_id: int) -> dict:
         pos.realized_pnl_copper = net_pnl
         pos.status = "vendored"
         pos.closed_at = now
-        await session.commit()
+        await psession.commit()
         return {"status": "vendored", "net_pnl": net_pnl}
 
 
 async def delete_position(pos_id: int) -> dict:
-    async with async_session_factory() as session:
-        pos = await session.get(TradePosition, pos_id)
+    async with personal_session_factory() as psession:
+        pos = await psession.get(TradePosition, pos_id)
         if pos:
-            await session.delete(pos)
-            await session.commit()
+            await psession.delete(pos)
+            await psession.commit()
         return {"status": "deleted"}
 
 
 async def get_portfolio_overview() -> dict:
-    async with async_session_factory() as session:
+    async with personal_session_factory() as psession:
         positions = list(
-            (await session.execute(select(TradePosition).order_by(desc(TradePosition.id)))).scalars().all()
+            (await psession.execute(select(TradePosition).order_by(desc(TradePosition.id)))).scalars().all()
         )
-        items_map = {
-            r.item_id: r for r in (await session.execute(select(ItemMeta))).scalars().all()
-        }
 
-        latest_snap = (
-            await session.execute(select(MarketTick.snapshot_id).order_by(desc(MarketTick.snapshot_id)).limit(1))
-        ).scalar_one_or_none()
-        latest_prices: dict[int, int] = {}
-        if latest_snap:
-            ticks = (
-                await session.execute(select(MarketTick).where(MarketTick.snapshot_id == latest_snap))
+    items_map: dict[int, ItemMeta] = {}
+    latest_prices: dict[int, int] = {}
+
+    item_ids = list({p.item_id for p in positions})
+    if item_ids:
+        async with async_session_factory() as msession:
+            meta_rows = (
+                await msession.execute(select(ItemMeta).where(ItemMeta.item_id.in_(item_ids)))
             ).scalars().all()
-            latest_prices = {t.item_id: t.entry_price for t in ticks}
+            items_map = {r.item_id: r for r in meta_rows}
+
+            latest_id_subq = (
+                select(MarketTick.item_id, func.max(MarketTick.id).label("max_id"))
+                .where(MarketTick.item_id.in_(item_ids), MarketTick.entry_price > 0)
+                .group_by(MarketTick.item_id)
+                .subquery()
+            )
+            tick_rows = (
+                await msession.execute(
+                    select(MarketTick.item_id, MarketTick.entry_price).join(
+                        latest_id_subq, MarketTick.id == latest_id_subq.c.max_id
+                    )
+                )
+            ).all()
+            latest_prices = {int(iid): int(ep or 0) for iid, ep in tick_rows}
 
     active_list = []
     closed_list = []
@@ -279,7 +301,7 @@ async def get_portfolio_overview() -> dict:
                 "expected_net": expected_net,
                 "status": p.status,
                 "comment": p.comment,
-                "bought_at": int(p.bought_at.replace(tzinfo=timezone.utc).timestamp()) if p.bought_at else 0,
+                "bought_at": _to_unix(p.bought_at),
             })
         else:
             realized_pnl_total += p.realized_pnl_copper
@@ -297,7 +319,7 @@ async def get_portfolio_overview() -> dict:
                 "realized_pnl": p.realized_pnl_copper,
                 "status": p.status,
                 "comment": p.comment,
-                "closed_at": int(p.closed_at.replace(tzinfo=timezone.utc).timestamp()) if p.closed_at else 0,
+                "closed_at": _to_unix(p.closed_at),
             })
 
     return {
@@ -319,9 +341,9 @@ async def get_portfolio_overview() -> dict:
 
 async def get_item_trade_events(item_id: int) -> list[dict]:
     """Возвращает точки покупок и продаж предмета для отрисовки прямо на графике."""
-    async with async_session_factory() as session:
+    async with personal_session_factory() as psession:
         rows = (
-            await session.execute(
+            await psession.execute(
                 select(TradePosition).where(TradePosition.item_id == item_id).order_by(TradePosition.id)
             )
         ).scalars().all()
@@ -329,30 +351,27 @@ async def get_item_trade_events(item_id: int) -> list[dict]:
     events = []
     for r in rows:
         if r.bought_at:
-            ts = r.bought_at if r.bought_at.tzinfo else r.bought_at.replace(tzinfo=timezone.utc)
             events.append({
                 "type": "buy",
-                "time": int(ts.timestamp()),
+                "time": _to_unix(r.bought_at),
                 "price_silver": round(r.buy_price_copper / 100.0, 2),
                 "price_copper": r.buy_price_copper,
                 "qty": r.qty,
                 "comment": r.comment,
             })
         if r.status == "sold" and r.closed_at:
-            ts = r.closed_at if r.closed_at.tzinfo else r.closed_at.replace(tzinfo=timezone.utc)
             events.append({
                 "type": "sold",
-                "time": int(ts.timestamp()),
+                "time": _to_unix(r.closed_at),
                 "price_silver": round(r.sell_price_copper / 100.0, 2),
                 "price_copper": r.sell_price_copper,
                 "qty": r.qty,
                 "pnl_copper": r.realized_pnl_copper,
             })
         elif r.status == "listed" and r.listed_at:
-            ts = r.listed_at if r.listed_at.tzinfo else r.listed_at.replace(tzinfo=timezone.utc)
             events.append({
                 "type": "listed",
-                "time": int(ts.timestamp()),
+                "time": _to_unix(r.listed_at),
                 "price_silver": round(r.list_price_copper / 100.0, 2),
                 "price_copper": r.list_price_copper,
                 "qty": r.qty,

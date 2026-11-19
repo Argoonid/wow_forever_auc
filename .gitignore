@@ -9,3 +9,5 @@ collector.log*
 dist/
 build/
 *.spec
+terminal_error.log
+app.ico

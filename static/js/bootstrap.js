@@ -37,6 +37,40 @@ function switchView(view) {
   else setTimeout(() => Bus.emit('chart:resize'), 50);
 }
 
+function setupBrowserLifecycleSync() {
+  const pingAlive = () => {
+    fetch('/api/lifecycle/ping', { method: 'POST', keepalive: true }).catch(() => {});
+  };
+
+  let channel = null;
+  if (typeof BroadcastChannel !== 'undefined') {
+    channel = new BroadcastChannel('forever_terminal_lifecycle');
+    channel.addEventListener('message', (e) => {
+      // Другая вкладка закрылась, но эта ещё жива — отменяем остановку трея
+      if (e.data === 'closing') pingAlive();
+    });
+  }
+
+  pingAlive();
+  window.addEventListener('pageshow', pingAlive);
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') pingAlive();
+  });
+
+  window.addEventListener('pagehide', (event) => {
+    if (event.persisted) return;
+    if (channel) {
+      try { channel.postMessage('closing'); } catch (_) {}
+      channel.close();
+    }
+    if (navigator.sendBeacon) {
+      navigator.sendBeacon('/api/lifecycle/closing', '');
+    } else {
+      fetch('/api/lifecycle/closing', { method: 'POST', keepalive: true }).catch(() => {});
+    }
+  });
+}
+
 // Тонкий мост только для статических onclick/oninput в index.html
 Object.assign(window, {
   switchView,
@@ -65,6 +99,8 @@ Object.assign(window, {
 });
 
 async function boot() {
+  setupBrowserLifecycleSync();
+
   initGlobalUx();
   initChartsModule();
   initMarketModule();

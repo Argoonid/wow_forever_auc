@@ -12,7 +12,7 @@ from database import async_session_factory, init_db
 from models import ItemMeta, MarketTick, SnapshotRun
 from resolver import resolve_missing_metadata
 from sources.blizzard_forever import BlizzardForeverSource
-from sources.tsm import TSMAuctionSource
+
 
 
 def trim_process_memory() -> None:
@@ -46,17 +46,11 @@ def setup_logging() -> None:
 async def store_and_analyze() -> None:
     logger = logging.getLogger("pipeline")
 
-    if settings.DATA_SOURCE.strip().lower() == "blizzard":
-        source = BlizzardForeverSource()
-        source_name = "blizzard"
-        source_label = "Blizzard API"
-        poll_seconds = 4 * 60  # Проверка заголовка Last-Modified каждые 4 минуты
-    else:
-        source = TSMAuctionSource()
-        source_name = getattr(source, "name", "tsm")
-        source_label = "TSM CSV"
-        poll_seconds = settings.POLL_INTERVAL_MINUTES * 60
-
+    source = BlizzardForeverSource()
+    source_name = "blizzard"
+    source_label = "Blizzard API"
+    poll_seconds = 4 * 60  # Проверка заголовка Last-Modified каждые 4 минуты
+   
     while True:
         try:
             await resolve_missing_metadata(batch_limit=150)
@@ -214,8 +208,7 @@ async def store_and_analyze() -> None:
 
 async def main() -> None:
     setup_logging()
-    mode = "Blizzard Game Data API" if settings.DATA_SOURCE.strip().lower() == "blizzard" else "TSM CSV"
-    logging.getLogger("main").info(f"Инициализация SQLite WAL и запуск коллектора [{mode}]...")
+    logging.getLogger("main").info("Инициализация БД и запуск коллектора [Blizzard Game Data API]...")
     await init_db()
     await store_and_analyze()
 
