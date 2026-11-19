@@ -30,7 +30,7 @@ def _normalize_db_url(raw_url: str) -> tuple[str, dict, bool]:
 
     connect_args = {
         "ssl": "require",
-        "statement_cache_size": 0,  # Обязательно для PgBouncer / Neon Pooler
+        "statement_cache_size": 0,
     }
     return clean_url, connect_args, True
 
@@ -40,18 +40,15 @@ MARKET_URL, _market_connect_args, IS_MARKET_POSTGRES = _normalize_db_url(_raw_ma
 
 _market_engine_kwargs = {"echo": False, "connect_args": _market_connect_args}
 if IS_MARKET_POSTGRES:
-    # Neon засыпает через 5 мин простоя — pre_ping и recycle исключают обрывы сокета
     _market_engine_kwargs.update({"pool_pre_ping": True, "pool_recycle": 240, "pool_size": 5, "max_overflow": 5})
 
 market_engine = create_async_engine(MARKET_URL, **_market_engine_kwargs)
 async_session_factory = async_sessionmaker(market_engine, class_=AsyncSession, expire_on_commit=False)
 
-# Личная локальная БД (портфель, радар, заметки на графике)
 PERSONAL_URL, _personal_connect_args, _ = _normalize_db_url(settings.PERSONAL_DATABASE_URL)
 personal_engine = create_async_engine(PERSONAL_URL, echo=False, connect_args=_personal_connect_args)
 personal_session_factory = async_sessionmaker(personal_engine, class_=AsyncSession, expire_on_commit=False)
 
-# Обратная совместимость со старыми импортами
 engine = market_engine
 
 
@@ -74,7 +71,10 @@ async def init_market_db() -> None:
     meta = _get_all_metadata()
     market_tables = [t for t in meta.sorted_tables if t.name not in PERSONAL_TABLES]
     async with market_engine.begin() as conn:
-        if not IS_MARKET_POSTGRES:
+        if IS_MARKET_POSTGRES:
+            await conn.execute(text("ALTER TABLE IF EXISTS items_meta ALTER COLUMN icon_name TYPE VARCHAR(255)"))
+            await conn.execute(text("ALTER TABLE IF EXISTS items_meta ALTER COLUMN name TYPE VARCHAR(255)"))
+        else:
             await conn.execute(text("PRAGMA journal_mode=WAL"))
             await conn.execute(text("PRAGMA synchronous=NORMAL"))
         await conn.run_sync(lambda sync_conn: meta.create_all(sync_conn, tables=market_tables))
