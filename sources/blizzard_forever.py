@@ -1,0 +1,414 @@
+import asyncio
+import logging
+import re
+from collections import defaultdict
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+import httpx
+from sqlalchemy import desc, or_, select
+from config import settings
+from database import async_session_factory
+from models import ItemMeta, MarketTick
+
+logger = logging.getLogger("source.blizzard")
+
+MIN_AUTO_ADD_PRICE_COPPER = 80
+
+
+class BlizzardForeverSource:
+    """Прямой коннектор к официальному Game Data API Blizzard для WoW: Forever."""
+
+    def __init__(self) -> None:
+        self.region = getattr(settings, "BNET_REGION", "eu").strip().lower()
+        self.ruleset_id = int(getattr(settings, "BNET_RULESET_ID", 1))
+        self.house_id = int(getattr(settings, "BNET_HOUSE_ID", 0))
+        self.namespace = f"dynamic-forever-{self.region}"
+        self.static_namespace = f"static-forever-{self.region}"
+        self.api_base = f"https://{self.region}.api.blizzard.com"
+        self.oauth_url = "https://oauth.battle.net/token"
+
+        self._access_token: str | None = None
+        self._token_expires_at: float = 0.0
+        self._last_modified_header: str | None = None
+        self._last_snapshot_ts: datetime | None = None
+        self._commodity_mode: str = "house_commodities"
+
+    async def _get_token(self, client: httpx.AsyncClient, force_refresh: bool = False) -> str:
+        now_ts = datetime.now(timezone.utc).timestamp()
+        if not force_refresh and self._access_token and now_ts < (self._token_expires_at - 120):
+            return self._access_token
+
+        client_id = settings.BNET_CLIENT_ID.strip()
+        client_secret = settings.BNET_CLIENT_SECRET.strip()
+        if not client_id or not client_secret:
+            raise RuntimeError("В .env не заполнены BNET_CLIENT_ID и BNET_CLIENT_SECRET")
+
+        resp = await client.post(
+            self.oauth_url,
+            auth=(client_id, client_secret),
+            data={"grant_type": "client_credentials"},
+            timeout=20.0,
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+        self._access_token = payload["access_token"]
+        self._token_expires_at = now_ts + float(payload.get("expires_in", 86400))
+        logger.info("Blizzard OAuth2: токен успешно получен.")
+        return self._access_token
+
+    @staticmethod
+    def _extract_house_ids(index_payload: dict) -> list[int]:
+        ids: list[int] = []
+        houses = index_payload.get("houses") or index_payload.get("auctions") or []
+        for h in houses:
+            if isinstance(h, int):
+                ids.append(h)
+            elif isinstance(h, dict):
+                if "id" in h:
+                    ids.append(int(h["id"]))
+                else:
+                    href = (h.get("key") or {}).get("href") or h.get("href") or ""
+                    m = re.search(r"/auctions/(\d+)", href)
+                    if m:
+                        ids.append(int(m.group(1)))
+        return sorted(set(ids))
+
+    async def _discover_active_house(self, client: httpx.AsyncClient, token: str) -> int:
+        if self.house_id > 0:
+            return self.house_id
+
+        headers = {"Authorization": f"Bearer {token}", "Accept-Encoding": "gzip"}
+        index_urls = [
+            f"{self.api_base}/data/wow/ruleset/{self.ruleset_id}/auctions/index",
+            f"{self.api_base}/data/wow/ruleset/{self.ruleset_id}/auctions/",
+        ]
+
+        candidate_ids: list[int] = []
+        for url in index_urls:
+            resp = await client.get(url, params={"namespace": self.namespace}, headers=headers, timeout=20.0)
+            if resp.status_code == 200:
+                data = resp.json()
+                candidate_ids = self._extract_house_ids(data)
+                if candidate_ids:
+                    logger.info(f"Blizzard Forever: найдены houseId в индексе: {candidate_ids}")
+                    break
+
+        if not candidate_ids:
+            candidate_ids = [110, 111, 113, 114, 116, 117, 119, 120, 121, 122, 123, 124, 125]
+
+        best_house = 0
+        best_count = -1
+        best_mode = "house_commodities"
+
+        reg_comm_url = f"{self.api_base}/data/wow/auctions/commodities"
+        r_reg = await client.get(reg_comm_url, params={"namespace": self.namespace}, headers=headers, timeout=30.0)
+        if r_reg.status_code == 200:
+            reg_aucs = r_reg.json().get("auctions") or []
+            if len(reg_aucs) > 0:
+                best_count = len(reg_aucs)
+                best_mode = "regional_commodities"
+
+        for hid in candidate_ids:
+            if best_mode != "regional_commodities":
+                comm_url = f"{self.api_base}/data/wow/ruleset/{self.ruleset_id}/auctions/{hid}/commodities"
+                r = await client.get(comm_url, params={"namespace": self.namespace}, headers=headers, timeout=25.0)
+                if r.status_code == 200:
+                    aucs = r.json().get("auctions") or []
+                    if len(aucs) > best_count:
+                        best_count = len(aucs)
+                        best_house = hid
+                        best_mode = "house_commodities"
+
+            if best_count <= 0:
+                auc_url = f"{self.api_base}/data/wow/ruleset/{self.ruleset_id}/auctions/{hid}"
+                r_all = await client.get(auc_url, params={"namespace": self.namespace}, headers=headers, timeout=25.0)
+                if r_all.status_code == 200:
+                    aucs = r_all.json().get("auctions") or []
+                    if len(aucs) > best_count:
+                        best_count = len(aucs)
+                        best_house = hid
+                        best_mode = "combined_house"
+
+        if best_count <= 0:
+            raise RuntimeError(f"Не удалось найти активные лоты в namespace={self.namespace}")
+
+        self.house_id = best_house if best_house > 0 else candidate_ids[0]
+        self._commodity_mode = best_mode
+        logger.info(f"Blizzard Forever: режим='{best_mode}', houseId={self.house_id} ({best_count} лотов).")
+        return self.house_id
+
+    async def _fetch_single_item_meta(
+        self, client: httpx.AsyncClient, token: str, item_id: int, sem: asyncio.Semaphore
+    ) -> dict | None:
+        headers = {"Authorization": f"Bearer {token}", "Accept-Encoding": "gzip"}
+        async with sem:
+            result = {"item_id": item_id, "name": None, "sell_price": None, "max_stack": None, "icon_url": None}
+            try:
+                r = await client.get(
+                    f"{self.api_base}/data/wow/item/{item_id}",
+                    params={"namespace": self.static_namespace, "locale": "ru_RU"},
+                    headers=headers,
+                    timeout=15.0,
+                )
+                if r.status_code == 200:
+                    data = r.json()
+                    name = data.get("name")
+                    if isinstance(name, dict):
+                        name = name.get("ru_RU") or name.get("en_US")
+                    if name:
+                        result["name"] = str(name)
+                    if data.get("sell_price") is not None:
+                        result["sell_price"] = int(data["sell_price"])
+                    if data.get("max_count"):
+                        result["max_stack"] = int(data["max_count"])
+
+                rm = await client.get(
+                    f"{self.api_base}/data/wow/media/item/{item_id}",
+                    params={"namespace": self.static_namespace},
+                    headers=headers,
+                    timeout=15.0,
+                )
+                if rm.status_code == 200:
+                    for a in rm.json().get("assets") or []:
+                        if a.get("key") == "icon" and a.get("value"):
+                            # Сохраняем полный URL Blizzard CDN, чтобы работали и кастомные иконки Forever
+                            result["icon_url"] = str(a["value"])
+                            break
+            except Exception:
+                return None
+            return result
+
+    async def resolve_unknown_items(
+        self, client: httpx.AsyncClient, token: str, limit: int = 80, include_non_http_icons: bool = False
+    ) -> int:
+        async with async_session_factory() as session:
+            conds = [
+                ItemMeta.name.like("Item_%"),
+                ItemMeta.icon_name.is_(None),
+                ItemMeta.icon_name == "",
+                ItemMeta.icon_name == "inv_misc_questionmark",
+            ]
+            if include_non_http_icons:
+                conds.append(~ItemMeta.icon_name.like("http%"))
+
+            stmt = select(ItemMeta).where(or_(*conds)).limit(limit)
+            rows = list((await session.execute(stmt)).scalars().all())
+            if not rows:
+                return 0
+
+            sem = asyncio.Semaphore(10)
+            tasks = [self._fetch_single_item_meta(client, token, r.item_id, sem) for r in rows]
+            fetched = await asyncio.gather(*tasks)
+
+            by_id = {r.item_id: r for r in rows}
+            updated = 0
+            for res in fetched:
+                if not res:
+                    continue
+                meta = by_id.get(res["item_id"])
+                if not meta:
+                    continue
+                changed = False
+                if res["name"] and (meta.name.startswith("Item_") or not meta.meta_resolved):
+                    meta.name = res["name"]
+                    changed = True
+                if res["sell_price"] is not None and res["sell_price"] > 0:
+                    meta.vendor_sell_price = res["sell_price"]
+                    changed = True
+                if res["max_stack"]:
+                    meta.max_stack = res["max_stack"]
+                if res["icon_url"]:
+                    meta.icon_name = res["icon_url"]
+                    changed = True
+                if changed:
+                    meta.meta_resolved = True
+                    updated += 1
+
+            if updated > 0:
+                await session.commit()
+                logger.info(f"Blizzard Static API: обновлено {updated}/{len(rows)} предметов (имена и иконки CDN).")
+            return updated
+
+    async def backfill_missing_meta(self, limit: int = 600) -> int:
+        """Разовая пакетная починка всех битых иконок и безымянных предметов в базе."""
+        async with httpx.AsyncClient() as client:
+            token = await self._get_token(client)
+            return await self.resolve_unknown_items(client, token, limit=limit, include_non_http_icons=True)
+
+    @staticmethod
+    def _analyze_commodity_book(lots: list[tuple[int, int]]) -> tuple[int, int, int, int, int]:
+        lots.sort(key=lambda x: x[0])
+        min_buyout = lots[0][0]
+        num_auctions = len(lots)
+
+        levels: list[tuple[int, int]] = []
+        total_qty = 0
+        for price, qty in lots:
+            total_qty += qty
+            if levels and levels[-1][0] == price:
+                levels[-1] = (price, levels[-1][1] + qty)
+            else:
+                levels.append((price, qty))
+
+        entry_price = min_buyout
+        cum_qty = 0
+        target_depth = min(5, max(1, total_qty))
+        for price, lvl_qty in levels:
+            cum_qty += lvl_qty
+            if cum_qty >= target_depth:
+                entry_price = price
+                break
+
+        half_levels = levels[: max(1, len(levels) // 2)]
+        wall_price = max(half_levels, key=lambda x: x[1])[0] if half_levels else entry_price
+        return min_buyout, entry_price, wall_price, total_qty, num_auctions
+
+    async def fetch_market_snapshot(self) -> tuple[datetime, list[MarketTick]]:
+        async with httpx.AsyncClient() as client:
+            token = await self._get_token(client)
+            house_id = await self._discover_active_house(client, token)
+            await self.resolve_unknown_items(client, token, limit=80)
+
+            if self._commodity_mode == "regional_commodities":
+                primary_url = f"{self.api_base}/data/wow/auctions/commodities"
+            elif self._commodity_mode == "combined_house":
+                primary_url = f"{self.api_base}/data/wow/ruleset/{self.ruleset_id}/auctions/{house_id}"
+            else:
+                primary_url = f"{self.api_base}/data/wow/ruleset/{self.ruleset_id}/auctions/{house_id}/commodities"
+
+            headers = {"Authorization": f"Bearer {token}", "Accept-Encoding": "gzip"}
+            if self._last_modified_header:
+                headers["If-Modified-Since"] = self._last_modified_header
+
+            resp = await client.get(primary_url, params={"namespace": self.namespace}, headers=headers, timeout=45.0)
+            if resp.status_code == 401:
+                token = await self._get_token(client, force_refresh=True)
+                headers["Authorization"] = f"Bearer {token}"
+                resp = await client.get(primary_url, params={"namespace": self.namespace}, headers=headers, timeout=45.0)
+
+            if resp.status_code == 304 and self._last_snapshot_ts is not None:
+                return self._last_snapshot_ts, []
+
+            resp.raise_for_status()
+
+            last_mod_raw = resp.headers.get("Last-Modified")
+            if last_mod_raw:
+                self._last_modified_header = last_mod_raw
+                snapshot_ts = parsedate_to_datetime(last_mod_raw).astimezone(timezone.utc)
+            else:
+                snapshot_ts = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+
+            self._last_snapshot_ts = snapshot_ts
+            primary_auctions = resp.json().get("auctions") or []
+
+            comm_books: dict[int, list[tuple[int, int]]] = defaultdict(list)
+            for row in primary_auctions:
+                item_obj = row.get("item") or {}
+                iid = int(item_obj.get("id") or 0)
+                qty = max(1, int(row.get("quantity") or 1))
+                unit_p = int(row.get("unit_price") or 0)
+                if unit_p <= 0:
+                    buyout = int(row.get("buyout") or 0)
+                    if buyout > 0:
+                        unit_p = buyout // qty
+                if iid > 0 and unit_p > 0:
+                    comm_books[iid].append((unit_p, qty))
+
+            regular_auctions = []
+            if self._commodity_mode != "combined_house" and house_id > 0:
+                items_url = f"{self.api_base}/data/wow/ruleset/{self.ruleset_id}/auctions/{house_id}"
+                items_resp = await client.get(
+                    items_url,
+                    params={"namespace": self.namespace},
+                    headers={"Authorization": f"Bearer {token}", "Accept-Encoding": "gzip"},
+                    timeout=45.0,
+                )
+                if items_resp.status_code == 200:
+                    regular_auctions = items_resp.json().get("auctions") or []
+
+            async with async_session_factory() as session:
+                known_meta = {
+                    r.item_id: r for r in (await session.execute(select(ItemMeta))).scalars().all()
+                }
+
+                latest_ticks_map: dict[int, int] = {}
+                subq = (
+                    select(MarketTick.item_id, MarketTick.market_value)
+                    .where(MarketTick.market_value > 0)
+                    .order_by(desc(MarketTick.id))
+                    .limit(1000)
+                )
+                for iid, mv in (await session.execute(subq)).all():
+                    if iid not in latest_ticks_map:
+                        latest_ticks_map[iid] = mv
+
+                reg_books: dict[int, list[tuple[int, int]]] = defaultdict(list)
+                for row in regular_auctions:
+                    item_obj = row.get("item") or {}
+                    iid = int(item_obj.get("id") or 0)
+                    if iid not in known_meta:
+                        continue
+                    buyout = int(row.get("buyout") or 0)
+                    qty = max(1, int(row.get("quantity") or 1))
+                    if buyout > 0:
+                        reg_books[iid].append((buyout // qty, qty))
+
+                ticks: list[MarketTick] = []
+                new_items_added = 0
+                dow = snapshot_ts.weekday()
+                hod = snapshot_ts.hour
+
+                for iid in set(comm_books.keys()) | set(reg_books.keys()):
+                    book = comm_books.get(iid) or reg_books.get(iid) or []
+                    if not book:
+                        continue
+
+                    min_b, entry_p, wall_p, total_q, num_auc = self._analyze_commodity_book(book)
+                    meta = known_meta.get(iid)
+
+                    if not meta:
+                        # Жёстко отсекаем мусор дешевле 80 меди и неликвид
+                        if entry_p < MIN_AUTO_ADD_PRICE_COPPER or (total_q < 40 and num_auc < 5):
+                            continue
+                        est_velocity = round(max(25.0, min(5000.0, total_q * 0.35)), 1)
+                        meta = ItemMeta(
+                            item_id=iid,
+                            name=f"Item_{iid}",
+                            category="shadow",
+                            is_active_pool=False,
+                            velocity_score=est_velocity,
+                        )
+                        session.add(meta)
+                        known_meta[iid] = meta
+                        new_items_added += 1
+                    elif meta.velocity_score <= 0:
+                        meta.velocity_score = round(max(15.0, min(5000.0, total_q * 0.35)), 1)
+
+                    ref_market = meta.tsm_market_value or latest_ticks_map.get(iid, 0)
+                    ticks.append(
+                        MarketTick(
+                            snapshot_ts=snapshot_ts,
+                            day_of_week=dow,
+                            hour_of_day=hod,
+                            source="blizzard",
+                            item_id=iid,
+                            min_buyout=min_b,
+                            entry_price=entry_p,
+                            wall_price=wall_p,
+                            market_value=ref_market,
+                            quantity=total_q,
+                            num_auctions=num_auc,
+                        )
+                    )
+
+                if new_items_added > 0:
+                    await session.commit()
+
+            if new_items_added > 0:
+                await self.resolve_unknown_items(client, token, limit=80)
+
+        logger.info(
+            f"Blizzard Forever ({self._commodity_mode}, house {self.house_id}): разобрано {len(primary_auctions)} лотов "
+            f"-> {len(ticks)} позиций (новых: {new_items_added})."
+        )
+        return snapshot_ts, ticks

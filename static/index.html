@@ -1,0 +1,342 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <title>WoW Forever — Терминал и портфель аукциона</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+  <script src="https://unpkg.com/lightweight-charts@4.2.3/dist/lightweight-charts.standalone.production.js"></script>
+</head>
+<body>
+  <div class="header">
+    <div style="display:flex; align-items:center; gap:18px;">
+      <div>
+        <h2>WoW Forever EU (PvP Alliance)</h2>
+        <span class="subtitle">Терминал аукциона • Учёт залогов и 5% комиссии</span>
+      </div>
+      <div class="nav-tabs">
+        <button id="tabBtnMarket" class="nav-tab active" onclick="switchView('market')">График и рынок</button>
+        <button id="tabBtnPortfolio" class="nav-tab" onclick="switchView('portfolio')">
+          Портфель и сделки <span id="portfolioBadge" class="badge-count">0</span>
+        </button>
+      </div>
+    </div>
+
+    <div id="headerPortfolioMini" class="header-mini-stats"></div>
+  </div>
+
+  <!-- ВКЛАДКА 1: ГРАФИК И РЫНОК -->
+  <div id="viewMarket" class="grid">
+    <div class="card">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
+        <h3 style="margin:0; font-size:13px; color:var(--text-muted);">СПРАВОЧНИК ПРЕДМЕТОВ</h3>
+        <button id="btnToggleHidden" class="small-btn" onclick="toggleShowHidden()">Скрытые: 0</button>
+      </div>
+
+      <div class="sidebar-controls">
+        <div class="search-wrap">
+          <input
+            id="itemSearchInput"
+            type="text"
+            placeholder="Начните вводить название..."
+            autocomplete="off"
+            oninput="onSidebarSearchInput()"
+            onfocus="onSidebarSearchInput()"
+            onkeydown="handleSearchKeydown(event, 'sidebar')"
+          />
+          <button id="btnClearSidebarSearch" class="search-clear-btn" style="display:none;" onclick="clearSidebarSearch()">✕</button>
+          <div id="sidebarSearchDropdown" class="autocomplete-dropdown" style="display:none;"></div>
+        </div>
+
+        <select id="itemSortSelect" class="dark-select" onchange="renderItemList()">
+          <option value="velocity">Сорт: Спрос/день</option>
+          <option value="price">Сорт: Цена (дороже)</option>
+          <option value="name">Сорт: По алфавиту</option>
+        </select>
+      </div>
+
+      <div id="itemList" class="item-list">Загрузка справочника...</div>
+    </div>
+
+    <div>
+      <div class="card" style="margin-bottom: 16px;">
+        <div class="chart-header">
+          <div style="display:flex; align-items:center; gap:10px;">
+            <img id="chartIcon" class="wow-icon-lg" src="https://wow.zamimg.com/images/wow/icons/medium/inv_misc_questionmark.jpg" />
+            <h3 id="chartTitle" style="margin:0; font-size:16px;">Выберите предмет</h3>
+            <button id="btnCopyTitle" class="copy-btn" onclick="copyCurrentItemName()">Копировать</button>
+            <button class="accent-btn" onclick="toggleQuickTradeForm()">+ Записать покупку / лот</button>
+          </div>
+
+          <div id="topPriceBar" class="top-price-bar">
+            <span class="top-metric">Загрузка...</span>
+          </div>
+        </div>
+
+        <!-- Быстрая форма записи сделки прямо из карточки графика -->
+        <div id="quickTradeBox" class="quick-trade-box" style="display:none;">
+          <div class="qt-row">
+            <span class="qt-label">Кол-во:</span>
+            <input id="qtQty" type="number" min="1" value="1" class="qty-input" oninput="updateQuickTradePreview()" />
+
+            <span class="qt-label">Купил за (1 шт):</span>
+            <div class="coin-capsule">
+              <label class="coin-cell" title="Золото">
+                <input id="qtBuyG" type="number" min="0" value="0" oninput="updateQuickTradePreview()" />
+                <span class="coin coin-gold"></span>
+              </label>
+              <span class="coin-sep"></span>
+              <label class="coin-cell" title="Серебро">
+                <input id="qtBuyS" type="number" min="0" max="99" value="0" oninput="updateQuickTradePreview()" />
+                <span class="coin coin-silver"></span>
+              </label>
+              <span class="coin-sep"></span>
+              <label class="coin-cell" title="Медь">
+                <input id="qtBuyC" type="number" min="0" max="99" value="0" oninput="updateQuickTradePreview()" />
+                <span class="coin coin-copper"></span>
+              </label>
+            </div>
+
+            <span class="qt-label">Выставить по (опц.):</span>
+            <div class="coin-capsule">
+              <label class="coin-cell" title="Золото">
+                <input id="qtListG" type="number" min="0" value="0" oninput="updateQuickTradePreview()" />
+                <span class="coin coin-gold"></span>
+              </label>
+              <span class="coin-sep"></span>
+              <label class="coin-cell" title="Серебро">
+                <input id="qtListS" type="number" min="0" max="99" value="0" oninput="updateQuickTradePreview()" />
+                <span class="coin coin-silver"></span>
+              </label>
+              <span class="coin-sep"></span>
+              <label class="coin-cell" title="Медь">
+                <input id="qtListC" type="number" min="0" max="99" value="0" oninput="updateQuickTradePreview()" />
+                <span class="coin coin-copper"></span>
+              </label>
+            </div>
+
+            <select id="qtHours" class="dark-select compact-select" onchange="updateQuickTradePreview()">
+              <option value="2">2 ч</option>
+              <option value="8" selected>8 ч</option>
+              <option value="24">24 ч</option>
+            </select>
+          </div>
+
+          <div class="qt-row" style="margin-top:8px;">
+            <input id="qtComment" type="text" placeholder="Комментарий (например: взял на вечернем сливе, выставил до утра)..." style="flex:1;" />
+            <span id="qtMathPreview" style="font-size:12px; color:var(--text-muted);"></span>
+            <button class="btn-success" onclick="submitQuickTrade()">Зафиксировать в портфеле</button>
+          </div>
+        </div>
+
+        <div class="toolbar">
+          <div class="days-group">
+            <span style="font-size:11.5px; color:var(--text-muted); margin-right:4px;">Таймлайн:</span>
+            <button id="days-1" class="day-btn" onclick="setDaysRange(1)">1 сутки</button>
+            <button id="days-3" class="day-btn" onclick="setDaysRange(3)">3 суток</button>
+            <button id="days-7" class="day-btn" onclick="setDaysRange(7)">7 суток</button>
+            <button id="days-0" class="day-btn active" onclick="setDaysRange(0)">Всё время</button>
+          </div>
+          <div class="divider"></div>
+          <button id="tool-none" class="active" onclick="selectTool('none')">Курсор</button>
+          <button id="tool-hline" onclick="selectTool('hline')">— Уровень</button>
+          <button id="tool-note" onclick="selectTool('note')">💬 Заметка</button>
+          <button class="danger" onclick="clearAllDrawings()">Очистить разметку</button>
+
+          <span id="dipSummary" style="font-size:12px; color:#facc15; display:inline-flex; align-items:center; gap:5px; margin-left:auto;"></span>
+        </div>
+
+        <!-- Всплывающий инпут для добавления текстовой заметки на график -->
+        <div id="notePromptBar" class="note-prompt-bar" style="display:none;">
+          <span id="notePromptCoords" style="font-size:12px; color:#fde047;"></span>
+          <input id="noteInputText" type="text" placeholder="Введите комментарий для этой точки..." style="flex:1;" onkeydown="if(event.key==='Enter') confirmChartNote()" />
+          <button class="btn-success" onclick="confirmChartNote()">Сохранить заметку</button>
+          <button onclick="cancelChartNote()">Отмена</button>
+        </div>
+
+        <div id="toolHintBar" style="font-size:12px; color:var(--accent-amber); margin-bottom:6px; min-height:16px;"></div>
+
+        <div class="chart-wrapper">
+          <div id="chart"></div>
+          <div id="cursorTooltip"></div>
+          <canvas id="drawOverlay"></canvas>
+        </div>
+      </div>
+
+      <div class="card" style="margin-bottom: 16px;">
+        <div style="display:flex; justify-content:space-between; align-items:center;">
+          <h3 style="margin:0; font-size:14px; color:var(--text-muted);">АКТУАЛЬНЫЕ КОЛЛЫ И ТОЧКИ ВХОДА</h3>
+          <button id="btnCopyAiDigest" class="accent-btn" onclick="copyAiDigest()" title="Скопировать срез цен, коллов и портфеля для анализа в чате">
+            📋 Скопировать срез для AI
+          </button>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>Сигнал</th>
+              <th>Предмет</th>
+              <th>Почему коллит</th>
+              <th>Купить &lt;=</th>
+              <th>Цель продажи</th>
+              <th>ROI</th>
+              <th>Пакет</th>
+              <th>Чистый профит</th>
+              <th>Спрос/день</th>
+            </tr>
+          </thead>
+          <tbody id="opsBody"></tbody>
+        </table>
+      </div>
+
+      <div class="card">
+        <div style="display:flex; flex-wrap:wrap; justify-content:space-between; align-items:center; gap:10px; margin-bottom:8px;">
+          <h3 style="margin:0; font-size:14px; color:var(--text-muted);">ИСТОРИЯ КОЛЛОВ И ПРОВЕРКА ПРЕДИКТОВ (24Ч)</h3>
+          <div id="callHistoryStats" style="font-size:12px; color:var(--text-muted);"></div>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>Время колла</th>
+              <th>Статус 24ч</th>
+              <th>Предмет</th>
+              <th>Сигнал</th>
+              <th>Вход (колл)</th>
+              <th>Предикт цели</th>
+              <th>Макс. факт за 24ч</th>
+              <th>Предикт / Факт ROI</th>
+            </tr>
+          </thead>
+          <tbody id="callHistoryBody"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- ВКЛАДКА 2: ПОРТФЕЛЬ И ЖУРНАЛ СДЕЛОК -->
+  <div id="viewPortfolio" style="display:none;">
+    <div id="portfolioKpiRow" class="kpi-grid"></div>
+
+    <div class="card" style="margin-bottom:16px;">
+      <h3 style="margin-top:0; font-size:14px; color:var(--text-muted);">НОВАЯ ПОКУПКА В ПОРТФЕЛЬ</h3>
+      <div class="qt-row">
+        <div class="pf-combobox-wrap">
+          <div class="pf-combobox-box">
+            <img id="pfSelectedIcon" class="wow-icon" src="https://wow.zamimg.com/images/wow/icons/medium/inv_misc_questionmark.jpg" />
+            <input
+              id="pfItemSearchInput"
+              type="text"
+              placeholder="Начните вводить название предмета..."
+              autocomplete="off"
+              oninput="onPortfolioSearchInput()"
+              onfocus="openPortfolioDropdown()"
+              onkeydown="handleSearchKeydown(event, 'portfolio')"
+            />
+            <button type="button" class="combo-drop-btn" onclick="togglePortfolioDropdown()" title="Показать список">▾</button>
+          </div>
+          <input id="pfSelectedItemId" type="hidden" value="" />
+          <div id="pfItemDropdown" class="autocomplete-dropdown pf-dropdown" style="display:none;"></div>
+        </div>
+
+        <span class="qt-label">Кол-во:</span>
+        <input id="pfQty" type="number" min="1" value="1" class="qty-input" oninput="updatePortfolioFormPreview()" />
+
+        <span class="qt-label">Цена за 1 шт:</span>
+        <div class="coin-capsule">
+          <label class="coin-cell" title="Золото">
+            <input id="pfBuyG" type="number" min="0" value="0" oninput="updatePortfolioFormPreview()" />
+            <span class="coin coin-gold"></span>
+          </label>
+          <span class="coin-sep"></span>
+          <label class="coin-cell" title="Серебро">
+            <input id="pfBuyS" type="number" min="0" max="99" value="0" oninput="updatePortfolioFormPreview()" />
+            <span class="coin coin-silver"></span>
+          </label>
+          <span class="coin-sep"></span>
+          <label class="coin-cell" title="Медь">
+            <input id="pfBuyC" type="number" min="0" max="99" value="0" oninput="updatePortfolioFormPreview()" />
+            <span class="coin coin-copper"></span>
+          </label>
+        </div>
+
+        <span class="qt-label">Сразу выставить по:</span>
+        <div class="coin-capsule">
+          <label class="coin-cell" title="Золото">
+            <input id="pfListG" type="number" min="0" value="0" oninput="updatePortfolioFormPreview()" />
+            <span class="coin coin-gold"></span>
+          </label>
+          <span class="coin-sep"></span>
+          <label class="coin-cell" title="Серебро">
+            <input id="pfListS" type="number" min="0" max="99" value="0" oninput="updatePortfolioFormPreview()" />
+            <span class="coin coin-silver"></span>
+          </label>
+          <span class="coin-sep"></span>
+          <label class="coin-cell" title="Медь">
+            <input id="pfListC" type="number" min="0" max="99" value="0" oninput="updatePortfolioFormPreview()" />
+            <span class="coin coin-copper"></span>
+          </label>
+        </div>
+
+        <select id="pfHours" class="dark-select compact-select" onchange="updatePortfolioFormPreview()">
+          <option value="2">2 ч</option>
+          <option value="8" selected>8 ч</option>
+          <option value="24">24 ч</option>
+        </select>
+      </div>
+      <div class="qt-row" style="margin-top:10px;">
+        <input id="pfComment" type="text" placeholder="Комментарий к сделке..." style="flex:1;" />
+        <span id="pfMathPreview" style="font-size:12px; color:var(--text-muted);"></span>
+        <button class="btn-success" onclick="submitPortfolioBuy()">Добавить в портфель</button>
+      </div>
+    </div>
+
+    <div class="card" style="margin-bottom:16px;">
+      <h3 style="margin-top:0; font-size:14px; color:var(--text-muted);">АКТИВНЫЕ ПОЗИЦИИ (НА РУКАХ И НА АУКЦИОНЕ)</h3>
+      <table>
+        <thead>
+          <tr>
+            <th>Статус</th>
+            <th>Предмет</th>
+            <th>Кол-во</th>
+            <th>Закуп (1 шт / всего)</th>
+            <th>Выставлено за 1 шт</th>
+            <th>Залог (акт. / сгорело)</th>
+            <th>Ожид. чистый профит (-5%)</th>
+            <th>Комментарий</th>
+            <th>Действия</th>
+          </tr>
+        </thead>
+        <tbody id="pfActiveBody"></tbody>
+      </table>
+    </div>
+
+    <div class="card">
+      <h3 style="margin-top:0; font-size:14px; color:var(--text-muted);">ЗАКРЫТЫЕ СДЕЛКИ</h3>
+      <table>
+        <thead>
+          <tr>
+            <th>Исход</th>
+            <th>Предмет</th>
+            <th>Кол-во</th>
+            <th>Куплено по</th>
+            <th>Продано по</th>
+            <th>Комиссия АН (5%)</th>
+            <th>Сгорело залогов</th>
+            <th>Чистый итог</th>
+            <th>Комментарий</th>
+          </tr>
+        </thead>
+        <tbody id="pfClosedBody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Модалка выставления / фиксации продажи -->
+  <div id="actionModal" class="modal-backdrop" style="display:none;">
+    <div class="modal-card">
+      <h3 id="modalTitle" style="margin-top:0; font-size:15px;">Действие с лотом</h3>
+      <div id="modalBody"></div>
+    </div>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
