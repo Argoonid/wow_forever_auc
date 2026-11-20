@@ -57,7 +57,7 @@ copy .env.example .env
 | `BNET_CLIENT_SECRET` | Client Secret приложения Battle.net |
 | `BNET_HOUSE_ID` | ID аукционного дома (`113` для EU Forever) |
 | `MARKET_DATABASE_URL` | Pooled-строка подключения владельца Neon PostgreSQL (для сборщика) |
-| `READER_DATABASE_URL` | Pooled-строка подключения read-only роли `ah_reader` (вшивается в релизный `.zip`) |
+
 
 ## Автоматизация
 
