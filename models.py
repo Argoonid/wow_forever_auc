@@ -12,7 +12,7 @@ class ItemMeta(Base):
 
     item_id: Mapped[int] = mapped_column(Integer, primary_key=True)
     name: Mapped[str] = mapped_column(String(255), index=True)
-    icon_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    icon_name: Mapped[str | None] = mapped_column(String(128), nullable=True, default=None)
     category: Mapped[str] = mapped_column(String(32), default="shadow")
     max_stack: Mapped[int] = mapped_column(Integer, default=20)
     vendor_sell_price: Mapped[int] = mapped_column(Integer, default=0)

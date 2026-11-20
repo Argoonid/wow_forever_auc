@@ -110,6 +110,10 @@ async def on_startup() -> None:
 async def index_page():
     return FileResponse(STATIC_DIR / "index.html")
 
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon():
+    return FileResponse(STATIC_DIR / "favicon.svg", media_type="image/svg+xml")
+
 
 @app.get("/api/items")
 async def api_items(min_price: int = Query(80, ge=0)):
