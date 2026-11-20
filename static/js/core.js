@@ -80,8 +80,15 @@ export function iconUrl(rawIcon) {
   return `https://wow.zamimg.com/images/wow/icons/medium/${slug}.jpg`;
 }
 
+export function normalizeIconName(iconName) {
+  if (!iconName) return 'inv_misc_questionmark';
+  const cleaned = String(iconName).trim().split('?')[0].replace(/\/+$/, '');
+  const base = cleaned.includes('/') ? cleaned.slice(cleaned.lastIndexOf('/') + 1) : cleaned;
+  return base.replace(/\.(jpg|jpeg|png)$/i, '').toLowerCase() || 'inv_misc_questionmark';
+}
+
 export function renderIconImg(iconName, cls = 'wow-icon') {
-  const safe = (iconName || 'inv_misc_questionmark').replace(/\.jpg$/i, '');
+  const safe = normalizeIconName(iconName);
   return `<img class="${cls}" src="/api/icon/${encodeURIComponent(safe)}.jpg" loading="lazy" decoding="async" alt="" />`;
 }
 // Трёхуровневый фолбэк: Wowhead CDN -> Blizzard Render CDN -> вопросительный знак
