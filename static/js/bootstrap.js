@@ -109,6 +109,12 @@ async function boot() {
 
   Bus.on('view:switch', switchView);
 
+  const backgroundLoads = Promise.all([
+    loadOpportunities(),
+    loadCallHistory(),
+    loadPortfolio(),
+  ]);
+
   await loadWatchlist();
   const items = await loadItems();
   const firstVisible = items.find((i) => !i.is_hidden) || items[0];
@@ -116,7 +122,7 @@ async function boot() {
     Bus.emit('item:select', { itemId: firstVisible.item_id });
   }
 
-  await Promise.all([loadOpportunities(), loadCallHistory(), loadPortfolio()]);
+  await backgroundLoads;
 }
 
 if (document.readyState === 'loading') {

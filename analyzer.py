@@ -1,10 +1,11 @@
 import logging
 import math
+import os
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from sqlalchemy import asc, desc, func, select
 from config import settings
-from database import async_session_factory
+from database import async_session_factory, personal_session_factory
 from models import ItemMeta, MarketTick, SignalCallLog, SnapshotRun, TradePosition
 
 logger = logging.getLogger("analyzer")
@@ -84,6 +85,12 @@ RAID_WATCHLIST_IDS: list[tuple[int, str]] = [
 ]
 
 
+def _is_market_read_only() -> bool:
+    if bool(getattr(settings, "MARKET_READ_ONLY", False)):
+        return True
+    return os.getenv("MARKET_READ_ONLY", "").strip().lower() in {"1", "true", "yes"}
+
+
 def format_wow_money(copper: int) -> str:
     sign = "-" if copper < 0 else ""
     c = abs(int(copper))
@@ -138,7 +145,10 @@ def _compute_qty_churn(quantities: list[int]) -> float:
 
 
 async def refresh_call_outcomes(session) -> None:
-    """Проверяет открытые спекулятивные коллы за 24ч и фиксирует результат с защитой от шума пустого стакана."""
+    """Проверяет открытые спекулятивные коллы за 24ч (только в режиме записи / коллекторе)."""
+    if _is_market_read_only():
+        return
+
     pending_calls = list(
         (await session.execute(select(SignalCallLog).where(SignalCallLog.status == "pending"))).scalars().all()
     )
@@ -148,11 +158,20 @@ async def refresh_call_outcomes(session) -> None:
     now = datetime.now(timezone.utc)
     updated = False
 
+    pending_item_ids = {c.item_id for c in pending_calls}
+    vendor_map = {
+        iid: int(vp or 0)
+        for iid, vp in (
+            await session.execute(
+                select(ItemMeta.item_id, ItemMeta.vendor_sell_price).where(ItemMeta.item_id.in_(pending_item_ids))
+            )
+        ).all()
+    }
+
     for call in pending_calls:
         call_ts = call.called_at if call.called_at.tzinfo else call.called_at.replace(tzinfo=timezone.utc)
         horizon_end = call_ts + timedelta(hours=24)
 
-        # Арбитраж ниже вендора закрывается мгновенно в NPC, а не по отскоку AH
         if call.tag == "НИЖЕ ВЕНДОРА":
             call.status = "hit"
             call.resolved_at = now
@@ -181,8 +200,7 @@ async def refresh_call_outcomes(session) -> None:
         max_seen = max(int(ep) for ep, _ in future_rows)
         if max_seen > call.max_observed_copper:
             call.max_observed_copper = max_seen
-            meta = await session.get(ItemMeta, call.item_id)
-            dep = calculate_deposit_copper(meta.vendor_sell_price if meta else 0, 1, hours=8)
+            dep = calculate_deposit_copper(vendor_map.get(call.item_id, 0), 1, hours=8)
             net_realized = int(max_seen * 0.95) - call.buy_price_copper - dep
             call.actual_roi = (
                 round((net_realized / call.buy_price_copper) * 100.0, 1)
@@ -191,7 +209,6 @@ async def refresh_call_outcomes(session) -> None:
             )
             updated = True
 
-        # Защита от фантомных отскоков: либо >= 2 среза на цели, либо 1 срез на живом стакане (>= 6 лотов)
         ticks_at_target = [int(na or 0) for ep, na in future_rows if int(ep) >= call.predicted_sell_copper]
         confirmed_hit = len(ticks_at_target) >= 2 or (
             len(ticks_at_target) >= 1 and max(ticks_at_target) >= 6
@@ -210,17 +227,19 @@ async def refresh_call_outcomes(session) -> None:
         await session.commit()
 
 
-async def get_scored_opportunities(snapshot_id: int | None = None, record_calls: bool = True) -> list[dict]:
+async def get_scored_opportunities(snapshot_id: int | None = None, record_calls: bool = False) -> list[dict]:
     max_budget_per_item = int(settings.BANKROLL_GOLD * 10000 * settings.MAX_SHARE_PER_ITEM)
     now_utc = datetime.now(timezone.utc)
     now_hour = now_utc.hour
+    can_write_cloud = record_calls and not _is_market_read_only()
 
     # Временные окна EU (UTC): 14-19 прайм-тайм слива фарма, 04-09 утренний тонкий стакан
     is_dump_window = 14 <= now_hour <= 19
     is_morning_peak = 4 <= now_hour <= 9
 
     async with async_session_factory() as session:
-        await refresh_call_outcomes(session)
+        if can_write_cloud:
+            await refresh_call_outcomes(session)
 
         if snapshot_id is None:
             latest_run = (
@@ -237,7 +256,6 @@ async def get_scored_opportunities(snapshot_id: int | None = None, record_calls:
         if snap_ts.tzinfo is None:
             snap_ts = snap_ts.replace(tzinfo=timezone.utc)
 
-        # Строго отсекаем скрытые позиции (даже если is_active_pool=True)
         items_stmt = select(ItemMeta).where(ItemMeta.is_hidden.is_(False))
         candidate_items = {row.item_id: row for row in (await session.execute(items_stmt)).scalars().all()}
         if not candidate_items:
@@ -251,7 +269,6 @@ async def get_scored_opportunities(snapshot_id: int | None = None, record_calls:
         if not current_ticks:
             return []
 
-        # Батч-загрузка истории строго ДО текущего среза (без утечки текущего тика и будущего)
         hist_run_ids = list(
             (
                 await session.execute(
@@ -297,7 +314,7 @@ async def get_scored_opportunities(snapshot_id: int | None = None, record_calls:
             if buy_price <= 0:
                 continue
 
-            # 1. Отдельная ветка: ЧИСТЫЙ безрисковый арбитраж в NPC-вендора
+            # 1. Безрисковый арбитраж в NPC-вендора
             vendor_price = int(meta.vendor_sell_price or 0)
             arb_buy = min_buyout if 0 < min_buyout < vendor_price else buy_price
             is_below_vendor = vendor_price > 0 and arb_buy < vendor_price
@@ -305,7 +322,6 @@ async def get_scored_opportunities(snapshot_id: int | None = None, record_calls:
             vendor_roi = (vendor_unit_profit / arb_buy * 100.0) if (is_below_vendor and arb_buy > 0) else 0.0
 
             max_by_budget_arb = max_budget_per_item // arb_buy if arb_buy > 0 else 0
-            # Для вендора консервативно оцениваем доступный объём (до половины стека или до 5 шт. на дне)
             arb_qty = min(meta.max_stack or 20, max_by_budget_arb, max(1, min(total_qty, 5)))
             pure_vendor_arb = (
                 is_below_vendor
@@ -350,7 +366,7 @@ async def get_scored_opportunities(snapshot_id: int | None = None, record_calls:
                 })
                 continue
 
-            # 2. Ветка аукционной спекуляции — жёсткие фильтры качества и ликвидности
+            # 2. Аукционная спекуляция
             if tick.item_id in VENDOR_JUNK_ITEM_IDS:
                 continue
             if buy_price < 20:
@@ -364,15 +380,11 @@ async def get_scored_opportunities(snapshot_id: int | None = None, record_calls:
             if median <= 0:
                 continue
 
-            # Полностью отвязано от мёртвого TSM: якоримся только на локальной истории и стене стакана
             ref_price = median
             z_score = (ref_price - buy_price) / r_std
             disc_median_pct = (1.0 - buy_price / median) * 100.0
-
-            # Базовая цель — андеркат 5% под локальную медиану
             target_sell = int(ref_price * 0.95)
 
-            # Микроструктура стены: если стена выше входа — встаём ПЕРЕД ней; если на дне — штрафуем скор
             wall_penalty = 1.0
             wall_note = ""
             if wall_price > 0:
@@ -382,13 +394,11 @@ async def get_scored_opportunities(snapshot_id: int | None = None, record_calls:
                         target_sell = capped_by_wall
                         wall_note = f"под стеной {format_wow_money(wall_price)}"
                 else:
-                    # Стена на дне в тонком стакане = массовый слив или репрайсинг, не ловим нож
                     if num_auctions < 60:
                         continue
                     wall_penalty = 0.35
                     wall_note = f"стена на дне {format_wow_money(wall_price)}"
 
-            # Защита от нереалистичной цели выше p75 локального окна
             if p75 > 0:
                 target_sell = min(target_sell, int(p75 * 0.98))
 
@@ -402,14 +412,12 @@ async def get_scored_opportunities(snapshot_id: int | None = None, record_calls:
 
             roi_pct = (net_profit_unit / buy_price) * 100.0
 
-            # Консервативный размер пакета: не предполагаем выкуп всего стакана по цене первых 5 шт.
             max_by_budget = max_budget_per_item // buy_price
             est_cheap_depth = max(1, min(total_qty // 4, meta.max_stack or 20))
             affordable_qty = min(meta.max_stack or 20, max_by_budget, est_cheap_depth)
             if affordable_qty <= 0:
                 continue
 
-            # Динамические пороги входа по времени суток и реальной глубине стакана
             is_highly_liquid = num_auctions >= 20 and qty_churn >= 15.0
             if is_morning_peak:
                 min_roi_required = 22.0
@@ -425,15 +433,10 @@ async def get_scored_opportunities(snapshot_id: int | None = None, record_calls:
                 continue
 
             total_profit = net_profit_unit * affordable_qty
-            # Отсекаем копеечный шум (меньше 15s профита на сделку не стоит слотов и перевыставов)
             if total_profit < 1500:
                 continue
 
-            # Тегирование и объяснение сигнала
-            if z_score >= 2.0 and disc_median_pct >= 22.0:
-                tag = "СИЛЬНОЕ ДНО"
-            else:
-                tag = "ПРОСАДКА"
+            tag = "СИЛЬНОЕ ДНО" if (z_score >= 2.0 and disc_median_pct >= 22.0) else "ПРОСАДКА"
 
             reason_parts = [
                 f"-{disc_median_pct:.0f}% от мед. ({format_wow_money(int(median))})",
@@ -445,12 +448,9 @@ async def get_scored_opportunities(snapshot_id: int | None = None, record_calls:
                 reason_parts.append(wall_note)
             reason_str = " • ".join(reason_parts)
 
-            # Логарифмический множитель реальной ликвидности (глубина стакана + оборот)
             depth_mult = math.log1p(num_auctions) / math.log1p(40.0)
             churn_mult = math.log1p(qty_churn) / math.log1p(50.0)
             liquidity_mult = max(0.25, 0.5 * depth_mult + 0.5 * churn_mult)
-
-            # Штраф, если наш пакет превышает ~30% среднего часового движения стакана
             turnover_penalty = min(1.0, max(0.35, (qty_churn * 4.0) / max(affordable_qty, 1)))
 
             score = (
@@ -485,8 +485,7 @@ async def get_scored_opportunities(snapshot_id: int | None = None, record_calls:
 
         opportunities.sort(key=lambda x: x["score"], reverse=True)
 
-        # Записываем в лог только спекулятивные коллы с дедупликацией по активным pending-позициям
-        if record_calls and opportunities:
+        if can_write_cloud and opportunities:
             active_pending_ids = set(
                 (
                     await session.execute(
@@ -527,10 +526,11 @@ async def get_scored_opportunities(snapshot_id: int | None = None, record_calls:
     return opportunities
 
 
-async def get_call_history_overview(limit: int = 50) -> dict:
-    """Возвращает историю всех коллов и сводку точности прогнозов."""
+async def get_call_history_overview(limit: int = 50, refresh: bool = False) -> dict:
+    """Возвращает историю коллов и сводку точности прогнозов без лишней записи в облако."""
     async with async_session_factory() as session:
-        await refresh_call_outcomes(session)
+        if refresh and not _is_market_read_only():
+            await refresh_call_outcomes(session)
 
         rows = list(
             (
@@ -541,14 +541,30 @@ async def get_call_history_overview(limit: int = 50) -> dict:
                 )
             ).scalars().all()
         )
-        all_calls = list((await session.execute(select(SignalCallLog))).scalars().all())
-        items_map = {r.item_id: r for r in (await session.execute(select(ItemMeta))).scalars().all()}
+        status_rows = (
+            await session.execute(
+                select(SignalCallLog.status, func.count(SignalCallLog.id)).group_by(SignalCallLog.status)
+            )
+        ).all()
 
-    total = len(all_calls)
-    hits = sum(1 for c in all_calls if c.status == "hit")
-    partials = sum(1 for c in all_calls if c.status == "partial")
-    missed = sum(1 for c in all_calls if c.status == "missed")
-    pending = sum(1 for c in all_calls if c.status == "pending")
+        row_item_ids = {c.item_id for c in rows}
+        items_map = (
+            {
+                r.item_id: r
+                for r in (
+                    await session.execute(select(ItemMeta).where(ItemMeta.item_id.in_(row_item_ids)))
+                ).scalars().all()
+            }
+            if row_item_ids
+            else {}
+        )
+
+    counts = {st: int(cnt) for st, cnt in status_rows}
+    hits = counts.get("hit", 0)
+    partials = counts.get("partial", 0)
+    missed = counts.get("missed", 0)
+    pending = counts.get("pending", 0)
+    total = sum(counts.values())
 
     resolved = hits + partials + missed
     hit_rate = round((hits / resolved) * 100.0, 1) if resolved > 0 else 0.0
@@ -592,9 +608,9 @@ async def get_call_history_overview(limit: int = 50) -> dict:
 
 
 async def build_ai_market_digest() -> str:
-    """Формирует срез рынка, коллов, портфеля и рейд-вотчлиста для анализа и калибровки модели."""
+    """Формирует срез рынка (Neon) + локального портфеля (personal.db) для AI-анализа."""
     ops = await get_scored_opportunities(record_calls=False)
-    calls_data = await get_call_history_overview(limit=20)
+    calls_data = await get_call_history_overview(limit=20, refresh=False)
 
     async with async_session_factory() as session:
         runs_count = (await session.execute(select(func.count(SnapshotRun.id)))).scalar() or 0
@@ -625,7 +641,6 @@ async def build_ai_market_digest() -> str:
 
         items_map = {r.item_id: r for r in (await session.execute(select(ItemMeta))).scalars().all()}
 
-        # Топ-25 самых активных позиций по РЕАЛЬНОМУ числу лотов в стакане Blizzard API
         top_liquid_ticks = sorted(
             [
                 t for t in latest_ticks_map.values()
@@ -692,9 +707,11 @@ async def build_ai_market_digest() -> str:
                 f"Лотов: {tick.num_auctions} (шт: {tick.quantity})"
             )
 
+    # Локальный портфель читаем строго из personal.db
+    async with personal_session_factory() as psession:
         open_positions = list(
             (
-                await session.execute(
+                await psession.execute(
                     select(TradePosition).where(TradePosition.status.in_(["holding", "listed"]))
                 )
             ).scalars().all()

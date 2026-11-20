@@ -80,21 +80,10 @@ export function iconUrl(rawIcon) {
   return `https://wow.zamimg.com/images/wow/icons/medium/${slug}.jpg`;
 }
 
-export function renderIconImg(rawIcon, extraStyle = '') {
-  const clean = String(rawIcon || 'inv_misc_questionmark').trim();
-  const slug = extractIconSlug(clean);
-  const primary = `https://wow.zamimg.com/images/wow/icons/medium/${slug}.jpg`;
-  const altCdn = slug === 'inv_misc_questionmark'
-    ? ''
-    : (clean.startsWith('http://') || clean.startsWith('https://'))
-      ? clean
-      : `https://render.worldofwarcraft.com/eu/icons/56/${slug}.jpg`;
-
-  const styleAttr = extraStyle ? ` style="${extraStyle}"` : '';
-  const altAttr = altCdn ? ` data-alt-cdn="${escapeHtml(altCdn)}"` : '';
-  return `<img class="wow-icon" src="${escapeHtml(primary)}"${altAttr} loading="lazy"${styleAttr} onerror="window.__iconFallback(this)" />`;
+export function renderIconImg(iconName, cls = 'wow-icon') {
+  const safe = (iconName || 'inv_misc_questionmark').replace(/\.jpg$/i, '');
+  return `<img class="${cls}" src="/api/icon/${encodeURIComponent(safe)}.jpg" loading="lazy" decoding="async" alt="" />`;
 }
-
 // Трёхуровневый фолбэк: Wowhead CDN -> Blizzard Render CDN -> вопросительный знак
 window.__iconFallback = function (img) {
   const step = Number(img.dataset.fbStep || '0');

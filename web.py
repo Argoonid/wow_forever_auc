@@ -1,9 +1,12 @@
+import asyncio
 import json
 import mimetypes
+import re
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from fastapi import FastAPI, Query
+import httpx
+from fastapi import FastAPI, Query, Response
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -16,6 +19,7 @@ from analyzer import (
 )
 from config import settings
 from database import async_session_factory, init_db, personal_session_factory
+from market_cache import market_cache
 from models import ChartDrawing, ItemMeta, MarketTick, TradePosition
 from portfolio import (
     create_buy_position,
@@ -39,6 +43,16 @@ BASE_DIR = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
 STATIC_DIR = BASE_DIR / "static"
 STATIC_DIR.mkdir(exist_ok=True)
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+# Дисковый кэш иконок живёт рядом с .exe / personal.db, чтобы переживать обновления релиза
+ICONS_CACHE_DIR = Path.cwd() / "icons_cache"
+ICONS_CACHE_DIR.mkdir(exist_ok=True)
+
+_ICON_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]{1,128}$")
+_ICON_CACHE_HEADERS = {"Cache-Control": "public, max-age=31536000, immutable"}
+_icon_http_client: httpx.AsyncClient | None = None
+_icon_sem = asyncio.Semaphore(8)
+_icon_locks: dict[str, asyncio.Lock] = {}
 
 VALID_BUCKETS = {"long_invest", "fast_flip", "watch"}
 
@@ -79,20 +93,93 @@ class WatchlistPayload(BaseModel):
     note: str = ""
 
 
+def _get_icon_client() -> httpx.AsyncClient:
+    global _icon_http_client
+    if _icon_http_client is None or _icon_http_client.is_closed:
+        _icon_http_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(6.0, connect=3.0),
+            follow_redirects=True,
+            headers={"User-Agent": "ForeverTerminal/1.0"},
+        )
+    return _icon_http_client
+
+
+def _resolve_icon_candidates(icon_name: str) -> tuple[str, ...]:
+    if icon_name.isdigit():
+        return (
+            f"https://render.worldofwarcraft.com/eu/icons/56/{icon_name}.jpg",
+            f"https://wow.zamimg.com/images/wow/icons/medium/{icon_name}.jpg",
+        )
+    return (
+        f"https://wow.zamimg.com/images/wow/icons/medium/{icon_name}.jpg",
+        f"https://render.worldofwarcraft.com/eu/icons/56/{icon_name}.jpg",
+    )
+
+
+async def _fetch_latest_snapshot_id() -> int | None:
+    async with async_session_factory() as msession:
+        return (await msession.execute(text("SELECT MAX(id) FROM snapshot_runs"))).scalar()
+
+
 async def _get_latest_price_map(session) -> dict[int, dict]:
-    latest_id_subq = (
-        select(MarketTick.item_id, func.max(MarketTick.id).label("max_id"))
-        .where(MarketTick.entry_price > 0)
-        .group_by(MarketTick.item_id)
-        .subquery()
-    )
-    stmt = select(MarketTick.item_id, MarketTick.entry_price, MarketTick.quantity).join(
-        latest_id_subq, MarketTick.id == latest_id_subq.c.max_id
-    )
+    dialect = session.get_bind().dialect.name
+    if dialect == "postgresql":
+        rows = (
+            await session.execute(
+                text(
+                    "SELECT DISTINCT ON (item_id) item_id, entry_price, quantity "
+                    "FROM market_ticks "
+                    "WHERE entry_price > 0 "
+                    "ORDER BY item_id, id DESC"
+                )
+            )
+        ).all()
+    else:
+        latest_id_subq = (
+            select(MarketTick.item_id, func.max(MarketTick.id).label("max_id"))
+            .where(MarketTick.entry_price > 0)
+            .group_by(MarketTick.item_id)
+            .subquery()
+        )
+        stmt = select(MarketTick.item_id, MarketTick.entry_price, MarketTick.quantity).join(
+            latest_id_subq, MarketTick.id == latest_id_subq.c.max_id
+        )
+        rows = (await session.execute(stmt)).all()
+
     return {
-        iid: {"price": int(ep or 0), "qty": int(q or 0)}
-        for iid, ep, q in (await session.execute(stmt)).all()
+        int(iid): {"price": int(ep or 0), "qty": int(q or 0)}
+        for iid, ep, q in rows
     }
+
+
+async def _get_cached_market_bundle() -> dict:
+    async def _load() -> dict:
+        async with async_session_factory() as msession:
+            stmt = select(ItemMeta).order_by(
+                desc(ItemMeta.is_active_pool), desc(ItemMeta.velocity_score), asc(ItemMeta.name)
+            )
+            rows = (await msession.execute(stmt)).scalars().all()
+            latest_map = await _get_latest_price_map(msession)
+
+        items_plain = [
+            {
+                "item_id": r.item_id,
+                "name": r.name,
+                "icon": r.icon_name or "inv_misc_questionmark",
+                "category": r.category,
+                "is_active_pool": bool(r.is_active_pool),
+                "cloud_hidden": bool(r.is_hidden),
+                "velocity_score": round(r.velocity_score, 1),
+                "market_value": int(r.tsm_market_value or 0),
+                "vendor_price": int(r.vendor_sell_price or 0),
+                "max_stack": int(r.max_stack or 20),
+            }
+            for r in rows
+        ]
+        meta_by_id = {item["item_id"]: item for item in items_plain}
+        return {"items": items_plain, "meta_by_id": meta_by_id, "latest_map": latest_map}
+
+    return await market_cache.get_core("market_bundle", _fetch_latest_snapshot_id, _load)
 
 
 async def _get_local_hidden_map() -> dict[int, bool]:
@@ -106,23 +193,66 @@ async def on_startup() -> None:
     await init_db()
 
 
+@app.on_event("shutdown")
+async def on_shutdown() -> None:
+    global _icon_http_client
+    if _icon_http_client is not None and not _icon_http_client.is_closed:
+        await _icon_http_client.aclose()
+        _icon_http_client = None
+
+
 @app.get("/")
 async def index_page():
     return FileResponse(STATIC_DIR / "index.html")
 
+
 @app.get("/favicon.ico", include_in_schema=False)
 async def favicon():
-    return FileResponse(STATIC_DIR / "favicon.svg", media_type="image/svg+xml")
+    icon_path = STATIC_DIR / "favicon.svg"
+    if not icon_path.is_file():
+        return Response(status_code=404)
+    return FileResponse(icon_path, media_type="image/svg+xml")
+
+
+@app.get("/api/icon/{icon_name}.jpg")
+async def api_icon_proxy(icon_name: str):
+    safe_name = icon_name.strip().lower()
+    if not _ICON_NAME_RE.match(safe_name):
+        return Response(status_code=400)
+
+    cached_path = ICONS_CACHE_DIR / f"{safe_name}.jpg"
+    if cached_path.is_file():
+        return FileResponse(cached_path, media_type="image/jpeg", headers=_ICON_CACHE_HEADERS)
+
+    lock = _icon_locks.setdefault(safe_name, asyncio.Lock())
+    async with lock:
+        if cached_path.is_file():
+            return FileResponse(cached_path, media_type="image/jpeg", headers=_ICON_CACHE_HEADERS)
+
+        client = _get_icon_client()
+        for url in _resolve_icon_candidates(safe_name):
+            try:
+                async with _icon_sem:
+                    resp = await client.get(url)
+                if resp.status_code == 200 and resp.content:
+                    tmp_path = cached_path.with_suffix(".tmp")
+                    tmp_path.write_bytes(resp.content)
+                    tmp_path.replace(cached_path)
+                    return Response(
+                        content=resp.content,
+                        media_type="image/jpeg",
+                        headers=_ICON_CACHE_HEADERS,
+                    )
+            except Exception:
+                continue
+
+    return Response(status_code=404)
 
 
 @app.get("/api/items")
 async def api_items(min_price: int = Query(80, ge=0)):
-    async with async_session_factory() as msession:
-        stmt = select(ItemMeta).order_by(
-            desc(ItemMeta.is_active_pool), desc(ItemMeta.velocity_score), asc(ItemMeta.name)
-        )
-        rows = (await msession.execute(stmt)).scalars().all()
-        latest_map = await _get_latest_price_map(msession)
+    bundle = await _get_cached_market_bundle()
+    latest_map = bundle["latest_map"]
 
     async with personal_session_factory() as psession:
         pf_ids = {
@@ -142,41 +272,42 @@ async def api_items(min_price: int = Query(80, ge=0)):
     protected_ids = pf_ids | wl_ids
 
     out = []
-    for r in rows:
-        latest = latest_map.get(r.item_id, {})
+    for r in bundle["items"]:
+        iid = r["item_id"]
+        latest = latest_map.get(iid, {})
         last_price = latest.get("price", 0)
         last_qty = latest.get("qty", 0)
-        effective_price = last_price if last_price > 0 else (r.tsm_market_value or 0)
+        effective_price = last_price if last_price > 0 else r["market_value"]
 
-        if min_price > 0 and effective_price > 0 and effective_price < min_price and r.item_id not in protected_ids:
+        if min_price > 0 and effective_price > 0 and effective_price < min_price and iid not in protected_ids:
             continue
 
-        is_hidden = local_hidden[r.item_id] if r.item_id in local_hidden else bool(r.is_hidden)
+        is_hidden = local_hidden[iid] if iid in local_hidden else r["cloud_hidden"]
         out.append({
-            "item_id": r.item_id,
-            "name": r.name,
-            "icon": r.icon_name or "inv_misc_questionmark",
-            "category": r.category,
-            "is_active_pool": r.is_active_pool,
+            "item_id": iid,
+            "name": r["name"],
+            "icon": r["icon"],
+            "category": r["category"],
+            "is_active_pool": r["is_active_pool"],
             "is_hidden": is_hidden,
-            "velocity_score": round(r.velocity_score, 1),
-            "market_value": r.tsm_market_value,
+            "velocity_score": r["velocity_score"],
+            "market_value": r["market_value"],
             "last_price": last_price,
             "effective_price": effective_price,
             "last_qty": last_qty,
-            "vendor_price": r.vendor_sell_price,
-            "max_stack": r.max_stack,
+            "vendor_price": r["vendor_price"],
+            "max_stack": r["max_stack"],
         })
     return out
 
 
 @app.post("/api/items/{item_id}/toggle-hide")
 async def api_toggle_hide(item_id: int):
-    async with async_session_factory() as msession:
-        item = await msession.get(ItemMeta, item_id)
-        if not item:
-            return {"error": "not found"}
-        cloud_hidden = bool(item.is_hidden)
+    bundle = await _get_cached_market_bundle()
+    item = bundle["meta_by_id"].get(item_id)
+    if not item:
+        return {"error": "not found"}
+    cloud_hidden = bool(item["cloud_hidden"])
 
     async with personal_session_factory() as psession:
         row = (
@@ -201,31 +332,38 @@ async def api_toggle_hide(item_id: int):
 
 @app.get("/api/opportunities")
 async def api_opportunities(min_price: int = Query(80, ge=0)):
-    ops = await get_scored_opportunities()
-    async with async_session_factory() as msession:
-        meta_map = {
-            r.item_id: r for r in (await msession.execute(select(ItemMeta))).scalars().all()
-        }
+    raw_ops = await market_cache.get_core(
+        "opportunities",
+        _fetch_latest_snapshot_id,
+        lambda: get_scored_opportunities(record_calls=False),
+    )
+    bundle = await _get_cached_market_bundle()
+    meta_map = bundle["meta_by_id"]
     local_hidden = await _get_local_hidden_map()
 
     filtered = []
-    for op in ops:
+    for op in raw_ops:
         if min_price > 0 and op.get("buy", 0) < min_price:
             continue
         iid = op["item_id"]
         m = meta_map.get(iid)
-        op["icon"] = (m.icon_name if m else None) or "inv_misc_questionmark"
-        op["is_hidden"] = local_hidden[iid] if iid in local_hidden else (bool(m.is_hidden) if m else False)
-        op["buy_fmt"] = format_wow_money(op["buy"])
-        op["sell_fmt"] = format_wow_money(op["sell"])
-        op["profit_fmt"] = format_wow_money(op["total_profit"])
-        filtered.append(op)
+        item = dict(op)
+        item["icon"] = m["icon"] if m else "inv_misc_questionmark"
+        item["is_hidden"] = local_hidden[iid] if iid in local_hidden else (m["cloud_hidden"] if m else False)
+        item["buy_fmt"] = format_wow_money(item["buy"])
+        item["sell_fmt"] = format_wow_money(item["sell"])
+        item["profit_fmt"] = format_wow_money(item["total_profit"])
+        filtered.append(item)
     return filtered
 
 
 @app.get("/api/calls/history")
 async def api_calls_history(limit: int = Query(50, ge=5, le=200)):
-    return await get_call_history_overview(limit=limit)
+    return await market_cache.get_core(
+        f"calls_history:{limit}",
+        _fetch_latest_snapshot_id,
+        lambda: get_call_history_overview(limit=limit, refresh=False),
+    )
 
 
 @app.get("/api/calls/digest")
@@ -280,89 +418,94 @@ def _build_dip_forecast(ticks: list[MarketTick], base_price_silver: float) -> li
 
 @app.get("/api/history/{item_id}")
 async def api_history(item_id: int, days: int = Query(0, ge=0, le=90)):
-    async with async_session_factory() as msession:
-        stmt = select(MarketTick).where(
-            MarketTick.item_id == item_id,
-            MarketTick.entry_price > 0,
-        )
-        if days > 0:
-            cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-            stmt = stmt.where(MarketTick.snapshot_ts >= cutoff)
-        stmt = stmt.order_by(asc(MarketTick.snapshot_ts), asc(MarketTick.id))
-        ticks = list((await msession.execute(stmt)).scalars().all())
-        meta = await msession.get(ItemMeta, item_id)
+    async def _load_market_history() -> dict:
+        async with async_session_factory() as msession:
+            stmt = select(MarketTick).where(
+                MarketTick.item_id == item_id,
+                MarketTick.entry_price > 0,
+            )
+            if days > 0:
+                cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+                stmt = stmt.where(MarketTick.snapshot_ts >= cutoff)
+            stmt = stmt.order_by(asc(MarketTick.snapshot_ts), asc(MarketTick.id))
+            ticks = list((await msession.execute(stmt)).scalars().all())
+            meta = await msession.get(ItemMeta, item_id)
 
-    max_gap_sec = settings.MAX_CONTINUOUS_GAP_MINUTES * 60
-    sessions: list[dict] = []
-    current_session: dict = {"line": [], "market_line": []}
-    gaps: list[dict] = []
+        max_gap_sec = settings.MAX_CONTINUOUS_GAP_MINUTES * 60
+        sessions: list[dict] = []
+        current_session: dict = {"line": [], "market_line": []}
+        gaps: list[dict] = []
 
-    prev_unix: int | None = None
-    first_unix: int | None = None
-    last_unix: int | None = None
+        prev_unix: int | None = None
+        first_unix: int | None = None
+        last_unix: int | None = None
 
-    for t in ticks:
-        ts = t.snapshot_ts
-        if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=timezone.utc)
-        unix_sec = int(ts.timestamp())
-        if first_unix is None:
-            first_unix = unix_sec
-        last_unix = unix_sec
+        for t in ticks:
+            ts = t.snapshot_ts
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            unix_sec = int(ts.timestamp())
+            if first_unix is None:
+                first_unix = unix_sec
+            last_unix = unix_sec
 
-        price_silver = round(t.entry_price / 100.0, 2)
-        market_silver = round(t.market_value / 100.0, 2) if t.market_value > 0 else 0.0
+            price_silver = round(t.entry_price / 100.0, 2)
+            market_silver = round(t.market_value / 100.0, 2) if t.market_value > 0 else 0.0
 
-        if prev_unix is not None and unix_sec == prev_unix:
-            if current_session["line"]:
-                current_session["line"][-1] = {"time": unix_sec, "value": price_silver}
+            if prev_unix is not None and unix_sec == prev_unix:
+                if current_session["line"]:
+                    current_session["line"][-1] = {"time": unix_sec, "value": price_silver}
+                if market_silver > 0:
+                    if current_session["market_line"] and current_session["market_line"][-1]["time"] == unix_sec:
+                        current_session["market_line"][-1] = {"time": unix_sec, "value": market_silver}
+                    else:
+                        current_session["market_line"].append({"time": unix_sec, "value": market_silver})
+                continue
+
+            if prev_unix is not None and (unix_sec - prev_unix) > max_gap_sec:
+                if current_session["line"]:
+                    sessions.append(current_session)
+                current_session = {"line": [], "market_line": []}
+                gaps.append({
+                    "start_time": prev_unix,
+                    "end_time": unix_sec,
+                    "hours": round((unix_sec - prev_unix) / 3600.0, 1),
+                })
+
+            current_session["line"].append({"time": unix_sec, "value": price_silver})
             if market_silver > 0:
-                if current_session["market_line"] and current_session["market_line"][-1]["time"] == unix_sec:
-                    current_session["market_line"][-1] = {"time": unix_sec, "value": market_silver}
-                else:
-                    current_session["market_line"].append({"time": unix_sec, "value": market_silver})
-            continue
+                current_session["market_line"].append({"time": unix_sec, "value": market_silver})
+            prev_unix = unix_sec
 
-        if prev_unix is not None and (unix_sec - prev_unix) > max_gap_sec:
-            if current_session["line"]:
-                sessions.append(current_session)
-            current_session = {"line": [], "market_line": []}
-            gaps.append({
-                "start_time": prev_unix,
-                "end_time": unix_sec,
-                "hours": round((unix_sec - prev_unix) / 3600.0, 1),
-            })
+        if current_session["line"]:
+            sessions.append(current_session)
 
-        current_session["line"].append({"time": unix_sec, "value": price_silver})
-        if market_silver > 0:
-            current_session["market_line"].append({"time": unix_sec, "value": market_silver})
-        prev_unix = unix_sec
+        base_silver = (meta.tsm_market_value / 100.0) if (meta and meta.tsm_market_value > 0) else (
+            ticks[-1].entry_price / 100.0 if ticks else 0.0
+        )
+        forecast_dips = _build_dip_forecast(ticks, base_silver)
 
-    if current_session["line"]:
-        sessions.append(current_session)
+        full_timeline: list[int] = []
+        if first_unix is not None and last_unix is not None:
+            start_hour = (first_unix // 3600) * 3600
+            end_hour = forecast_dips[-1]["time"] if forecast_dips else ((last_unix // 3600) * 3600)
+            cursor_ts = start_hour
+            while cursor_ts <= end_hour:
+                full_timeline.append(cursor_ts)
+                cursor_ts += 3600
 
-    base_silver = (meta.tsm_market_value / 100.0) if (meta and meta.tsm_market_value > 0) else (
-        ticks[-1].entry_price / 100.0 if ticks else 0.0
+        return {
+            "full_timeline": full_timeline,
+            "sessions": sessions,
+            "gaps": gaps,
+            "forecast_dips": forecast_dips,
+        }
+
+    market_part = await market_cache.get_history(
+        f"{item_id}:{days}", _fetch_latest_snapshot_id, _load_market_history
     )
-    forecast_dips = _build_dip_forecast(ticks, base_silver)
     trade_events = await get_item_trade_events(item_id)
-
-    full_timeline: list[int] = []
-    if first_unix is not None:
-        start_hour = (first_unix // 3600) * 3600
-        end_hour = forecast_dips[-1]["time"] if forecast_dips else ((last_unix // 3600) * 3600)
-        cursor_ts = start_hour
-        while cursor_ts <= end_hour:
-            full_timeline.append(cursor_ts)
-            cursor_ts += 3600
-
-    return {
-        "full_timeline": full_timeline,
-        "sessions": sessions,
-        "gaps": gaps,
-        "forecast_dips": forecast_dips,
-        "trade_events": trade_events,
-    }
+    return {**market_part, "trade_events": trade_events}
 
 
 # === РАЗМЕТКА ГРАФИКОВ (personal.db) ===
@@ -407,7 +550,7 @@ async def clear_drawings(item_id: int):
         return {"status": "cleared"}
 
 
-# === РАДАР / ИНВЕСТ (personal.db + цены из Neon) ===
+# === РАДАР / ИНВЕСТ (personal.db + цены из кэша Neon) ===
 
 @app.get("/api/watchlist")
 async def api_watchlist_list():
@@ -424,22 +567,22 @@ async def api_watchlist_list():
     if not rows:
         return []
 
-    async with async_session_factory() as msession:
-        meta_map = {r.item_id: r for r in (await msession.execute(select(ItemMeta))).scalars().all()}
-        latest_map = await _get_latest_price_map(msession)
+    bundle = await _get_cached_market_bundle()
+    meta_map = bundle["meta_by_id"]
+    latest_map = bundle["latest_map"]
 
     items = []
     for iid, bucket, added_p, t_buy, t_sell, note, created_at in rows:
         meta = meta_map.get(iid)
         latest = latest_map.get(iid, {})
-        curr_price = latest.get("price", 0) or (meta.tsm_market_value if meta else 0)
+        curr_price = latest.get("price", 0) or (meta["market_value"] if meta else 0)
         curr_qty = latest.get("qty", 0)
         delta_pct = round(((curr_price - added_p) / added_p) * 100.0, 1) if (added_p > 0 and curr_price > 0) else 0.0
 
         items.append({
             "item_id": iid,
-            "name": meta.name if meta else f"Item_{iid}",
-            "icon": (meta.icon_name if meta else None) or "inv_misc_questionmark",
+            "name": meta["name"] if meta else f"Item_{iid}",
+            "icon": meta["icon"] if meta else "inv_misc_questionmark",
             "bucket": bucket,
             "added_price": added_p,
             "current_price": curr_price,
@@ -449,7 +592,7 @@ async def api_watchlist_list():
             "target_sell": t_sell,
             "in_buy_zone": bool(t_buy > 0 and curr_price > 0 and curr_price <= t_buy),
             "in_sell_zone": bool(t_sell > 0 and curr_price > 0 and curr_price >= t_sell),
-            "velocity": round(meta.velocity_score, 1) if meta else 0.0,
+            "velocity": meta["velocity_score"] if meta else 0.0,
             "note": note or "",
             "created_at": created_at,
         })
@@ -485,10 +628,11 @@ async def api_watchlist_upsert(payload: WatchlistPayload):
                 },
             )
         else:
-            async with async_session_factory() as msession:
-                latest_map = await _get_latest_price_map(msession)
-                meta = await msession.get(ItemMeta, payload.item_id)
-                curr_p = latest_map.get(payload.item_id, {}).get("price", 0) or (meta.tsm_market_value if meta else 0)
+            bundle = await _get_cached_market_bundle()
+            meta = bundle["meta_by_id"].get(payload.item_id)
+            curr_p = bundle["latest_map"].get(payload.item_id, {}).get("price", 0) or (
+                meta["market_value"] if meta else 0
+            )
 
             await psession.execute(
                 text(
