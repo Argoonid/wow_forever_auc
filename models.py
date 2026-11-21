@@ -1,5 +1,6 @@
 from datetime import datetime
-from sqlalchemy import JSON, Boolean, Column, DateTime, Float, ForeignKey, Index, Integer, String, Text, func
+from typing import Any
+from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Index, Integer, String, Text, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -59,14 +60,18 @@ class MarketTick(Base):
     market_value: Mapped[int] = mapped_column(Integer, default=0)
     quantity: Mapped[int] = mapped_column(Integer, default=0)
     num_auctions: Mapped[int] = mapped_column(Integer, default=0)
-    cheap_qty = Column(Integer, nullable=False, default=0)        # Объём в пределах +5% от entry_price
-    gap_qty = Column(Integer, nullable=False, default=0)          # "Воздушный карман" между входом и стеной
-    book_p25_price = Column(Integer, nullable=False, default=0)   # Цена на 25% накопленного объёма книги
-    est_sold_qty = Column(Integer, nullable=False, default=0)     # Оценка реальных выкупов за последний час
-    est_sold_vwap = Column(Integer, nullable=False, default=0)    # Средневзвешенная цена этих выкупов
+
+    # Геометрия стакана и синтетическая лента сделок (v4)
+    cheap_qty: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    gap_qty: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    book_p25_price: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    est_sold_qty: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    est_sold_vwap: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
     __table_args__ = (
         Index("ix_tick_item_season", "item_id", "day_of_week", "hour_of_day"),
+        Index("ix_market_ticks_source_snap", "source", "snapshot_id"),
+        Index("ix_market_ticks_snap_item", "snapshot_id", "item_id"),
     )
 
 
@@ -119,7 +124,9 @@ class SignalCallLog(Base):
     item_id: Mapped[int] = mapped_column(Integer, index=True)
 
     tag: Mapped[str] = mapped_column(String(24))
-    reason: Mapped[str] = mapped_column(String(128), default="")
+    reason: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    model_version: Mapped[str] = mapped_column(String(16), nullable=False, default="v4")
+    metrics: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True, default=None)
 
     buy_price_copper: Mapped[int] = mapped_column(Integer)
     predicted_sell_copper: Mapped[int] = mapped_column(Integer)
@@ -135,7 +142,3 @@ class SignalCallLog(Base):
     max_observed_copper: Mapped[int] = mapped_column(Integer, default=0)
     actual_roi: Mapped[float] = mapped_column(Float, default=0.0)
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-
-    reason = Column(Text, nullable=False, default="")             # Заменить String(128) на Text
-    model_version = Column(String(16), nullable=False, default="v4")
-    metrics = Column(JSON, nullable=True)                         # Или JSONB из sqlalchemy.dialects.postgresql

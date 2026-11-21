@@ -11,7 +11,10 @@ class Settings(BaseSettings):
     BNET_CLIENT_SECRET: str = ""
     BNET_REGION: str = "eu"
     BNET_RULESET_ID: int = 1
-    BNET_HOUSE_ID: int = 0
+    BNET_HOUSE_ID: int = 110
+
+    # Отсечка первого чистого среза house_110 (игнорирует старые тики house_113 в расчётах)
+    ANALYZER_MIN_SNAPSHOT_ID: int = 81
 
     BANKROLL_GOLD: float = 10.0
     MAX_SHARE_PER_ITEM: float = 0.25

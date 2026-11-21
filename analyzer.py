@@ -15,10 +15,11 @@ logger = logging.getLogger("analyzer")
 
 MODEL_VERSION = "v4"
 
-# Глубина кэша: до 120 чистых часовых срезов Blizzard (~5 суток для устойчивых персональных часов)
+# Глубина кэша: до 120 чистых часовых срезов Blizzard (~5 суток для персональных часов)
 HIST_WINDOW_SNAPSHOTS = 120
 REGIME_WINDOW_TICKS = 72
 MIN_HIST_TICKS_FLIP = 14
+MIN_TICKS_FOR_CLOCK_BOOST = 96
 MIN_AUCTIONS_FLIP = 6
 MIN_TOTAL_QTY_FLIP = 15
 MIN_QTY_CHURN_FLIP = 2.0
@@ -105,7 +106,7 @@ class _SnapshotCache:
     checked_at: float = 0.0
     items_map: dict[int, _MetaLite] = field(default_factory=dict)
     latest_ticks: dict[int, _TickLite] = field(default_factory=dict)
-    # item_id -> [(entry_price, qty, num_auctions, hour_of_day, day_of_week, est_sold_qty), ...] строго source='blizzard'
+    # item_id -> [(entry_price, qty, num_auctions, hour_of_day, day_of_week, est_sold_qty), ...]
     hist_by_item: dict[int, list[tuple[int, int, int, int, int, int]]] = field(default_factory=dict)
     scored_cache_key: tuple[int, float, float] | None = None
     scored_ops: list[dict] = field(default_factory=list)
@@ -221,7 +222,6 @@ def _compute_item_clock(
             "hours_to_peak": 12,
         }
 
-    # Круговое 3-часовое окно [h-1, h, h+1] сглаживает дыры и шум при 2-5 днях истории
     smooth_med: dict[int, float] = {}
     for h in range(24):
         bucket = by_hour.get((h - 1) % 24, []) + by_hour.get(h, []) + by_hour.get((h + 1) % 24, [])
@@ -260,11 +260,8 @@ def _analyze_price_regime(
     clock: dict,
 ) -> dict:
     """
-    Режимный фильтр v4 на последних 72ч чистых тиков Blizzard:
-    1. Убивает долгий структурный спад (умирающие лоу-лвл ресурсы).
-    2. Убивает падающий нож (последние 6ч против предыдущих 12ч).
-    3. Ограничивает цель реальным 2-часовым удержанным потолком за последние 24 тика.
-    4. Подтверждает наличие свежего цикла возврата (маятника).
+    Режимный фильтр v4 на последних 72ч чистых тиков house_110:
+    убивает умирающие тренды, падающие ножи и разовые всплески; требует подтверждённый цикл.
     """
     recent_series = series[-REGIME_WINDOW_TICKS:]
     prices = [x[0] for x in recent_series]
@@ -289,7 +286,7 @@ def _analyze_price_regime(
         if prev_12_med > 0 and last_6_med < prev_12_med * 0.88 and max(last_6) < prev_12_med * 0.95:
             return {"tradable": False, "reason": "falling_knife"}
 
-    # 2. Устойчивая полка (3-часовой rolling min за окно + жёсткая проверка за последние 24 тика)
+    # 2. Устойчивая полка (3-часовой rolling min + обязательная проверка за последние 24 тика)
     sustained_3h = [min(prices[i : i + 3]) for i in range(n - 2)]
     plateau_window = _percentile(sorted(sustained_3h), 0.80)
 
@@ -297,9 +294,15 @@ def _analyze_price_regime(
     sustained_2h_24 = [min(recent_24[i : i + 2]) for i in range(len(recent_24) - 1)]
     fresh_ceiling_24 = float(max(sustained_2h_24)) if sustained_2h_24 else plateau_window
 
-    # Если у актива есть выраженные персональные часы — учитываем пиковую медиану как ориентир, но не выше fresh_ceiling_24
     ref_plateau = min(plateau_window, fresh_ceiling_24)
-    if clock["has_clock"] and clock["clock_edge_pct"] >= 18.0 and clock["peak_med"] > 0:
+
+    # Подтягиваем полку по персональным часам только когда накопилось >= 96 срезов (4 суток)
+    if (
+        len(series) >= MIN_TICKS_FOR_CLOCK_BOOST
+        and clock["has_clock"]
+        and clock["clock_edge_pct"] >= 18.0
+        and clock["peak_med"] > 0
+    ):
         ref_plateau = min(max(ref_plateau, clock["peak_med"] * 0.96), fresh_ceiling_24)
 
     recent_low = _percentile(sorted(recent_24), 0.20)
@@ -340,7 +343,7 @@ def _analyze_price_regime(
 
 
 async def _load_snapshot_context(snapshot_id: int | None = None, force_reload: bool = False) -> _SnapshotCache | None:
-    """Кэширует срез + 120ч чистой истории Blizzard в RAM (1 загрузка в час)."""
+    """Кэширует срез + 120ч чистой истории Blizzard (строго начиная с ANALYZER_MIN_SNAPSHOT_ID)."""
     now_mono = time.monotonic()
 
     if (
@@ -361,10 +364,17 @@ async def _load_snapshot_context(snapshot_id: int | None = None, force_reload: b
         ):
             return _cache
 
+        min_snap_id = _min_snapshot_id()
+
         async with async_session_factory() as session:
             if snapshot_id is None:
                 latest_run = (
-                    await session.execute(select(SnapshotRun).order_by(desc(SnapshotRun.snapshot_ts)).limit(1))
+                    await session.execute(
+                        select(SnapshotRun)
+                        .where(SnapshotRun.id >= min_snap_id)
+                        .order_by(desc(SnapshotRun.id))
+                        .limit(1)
+                    )
                 ).scalar_one_or_none()
                 if not latest_run:
                     return None
@@ -374,7 +384,6 @@ async def _load_snapshot_context(snapshot_id: int | None = None, force_reload: b
                 if not target_run:
                     return None
 
-            min_snap_id = _min_snapshot_id()
             if min_snap_id > 0 and target_run.id < min_snap_id:
                 return None
 
@@ -385,7 +394,6 @@ async def _load_snapshot_context(snapshot_id: int | None = None, force_reload: b
             raw_snap_ts = target_run.snapshot_ts
             snap_ts_utc = raw_snap_ts if raw_snap_ts.tzinfo else raw_snap_ts.replace(tzinfo=timezone.utc)
 
-            # Считаем именно чистые срезы Blizzard начиная с отсечки house_110
             runs_count = int(
                 (
                     await session.execute(
@@ -475,16 +483,16 @@ async def _load_snapshot_context(snapshot_id: int | None = None, force_reload: b
                     est_sold_vwap=int(row[12] or 0) if has_v4_cols else 0,
                 )
 
-            # История СТРОГО source='blizzard', до текущего среза и не раньше отсечки house_110
+            # История строго по монотонному id: >= min_snap_id и строго < target_run.id
             hist_run_ids = list(
                 (
                     await session.execute(
                         select(SnapshotRun.id)
                         .where(
-                            SnapshotRun.snapshot_ts < raw_snap_ts,
                             SnapshotRun.id >= min_snap_id,
+                            SnapshotRun.id < target_run.id,
                         )
-                        .order_by(desc(SnapshotRun.snapshot_ts))
+                        .order_by(desc(SnapshotRun.id))
                         .limit(HIST_WINDOW_SNAPSHOTS)
                     )
                 ).scalars().all()
@@ -511,7 +519,7 @@ async def _load_snapshot_context(snapshot_id: int | None = None, force_reload: b
                             MarketTick.snapshot_id.in_(hist_run_ids),
                             MarketTick.entry_price > 0,
                         )
-                        .order_by(asc(MarketTick.snapshot_ts))
+                        .order_by(asc(MarketTick.snapshot_id))
                     )
                 ).all()
 
@@ -545,7 +553,7 @@ async def _load_snapshot_context(snapshot_id: int | None = None, force_reload: b
 
 
 async def refresh_call_outcomes(session) -> None:
-    """Батчевая проверка открытых коллов за 24ч строго по чистым срезам Blizzard."""
+    """Батчевая проверка открытых коллов за 24ч строго по чистым срезам house_110."""
     if _is_market_read_only():
         return
 
@@ -643,10 +651,8 @@ async def refresh_call_outcomes(session) -> None:
 def _score_from_cache(ctx: _SnapshotCache) -> list[dict]:
     """
     Скоринг v4:
-    - Персональные часы актива (противофаза сырьё vs расходники)
-    - Жёсткий запрет стены на дне, падающих ножей и умирающих трендов
-    - Оценка воздушного кармана (gap_qty) и реальных выкупов (est_sold_qty)
-    - Оптимизация слота (8ч/24ч) через E[PnL] с учётом реального риска залога
+    Персональные часы актива, защита от покупки выше медианы, оценка воздушного кармана
+    и выбор слота (8ч/24ч) через честное матожидание E[PnL] с учётом риска залога.
     """
     bankroll_gold = float(settings.BANKROLL_GOLD)
     max_share = float(settings.MAX_SHARE_PER_ITEM)
@@ -678,10 +684,6 @@ def _score_from_cache(ctx: _SnapshotCache) -> list[dict]:
         if num_auctions < MIN_AUCTIONS_FLIP or total_qty < MIN_TOTAL_QTY_FLIP:
             continue
 
-        # 1. Жёсткий бан стены на дне: если крупная стена лежит прямо на цене входа — не ловим нож
-        if wall_price > 0 and wall_price <= int(buy_price * 1.04):
-            continue
-
         hist_series = ctx.hist_by_item.get(iid, [])
         if len(hist_series) < MIN_HIST_TICKS_FLIP:
             continue
@@ -700,55 +702,65 @@ def _score_from_cache(ctx: _SnapshotCache) -> list[dict]:
         if effective_flow < MIN_QTY_CHURN_FLIP and median_aucs < 12:
             continue
 
-        # 2. Персональные биологические часы актива + режимный фильтр графика
+        # 1. Персональные биологические часы + режимный фильтр графика
         clock = _compute_item_clock(hist_series, cur_hour)
         regime = _analyze_price_regime(hist_series, clock)
         if not regime["tradable"]:
             continue
 
-        median, r_std, _, p75 = _compute_robust_stats(local_prices)
+        median, r_std, _, _ = _compute_robust_stats(local_prices)
         ref_plateau = regime["ref_plateau"]
         bounces = regime["bounces"]
 
+        # Страховка: не покупаем "дно", если цена входа выше локальной медианы
+        if median <= 0 or buy_price > int(median * 1.02):
+            continue
         if buy_price >= ref_plateau * 0.90:
             continue
 
-        z_score = (ref_plateau - buy_price) / r_std
-        disc_plateau_pct = (1.0 - buy_price / ref_plateau) * 100.0
+        # 2. Геометрия стены: жёсткий бан стены на дне, кроме сверхликвидных маятников (200+ лотов)
+        wall_note = ""
+        is_dump_floor_wall = False
         target_sell = int(ref_plateau * 0.95)
 
-        # Встаём строго перед стеной сопротивления
-        wall_note = ""
         if wall_price > 0:
-            capped_by_wall = int(wall_price * 0.98)
-            if capped_by_wall < target_sell:
-                target_sell = capped_by_wall
-                wall_note = f"под стеной {format_wow_money(wall_price)}"
+            if wall_price <= int(buy_price * 1.04):
+                if num_auctions < 200 or bounces < 2:
+                    continue
+                is_dump_floor_wall = True
+                wall_note = f"дамп-стена {format_wow_money(wall_price)}"
+            else:
+                capped_by_wall = int(wall_price * 0.98)
+                if capped_by_wall < target_sell:
+                    target_sell = capped_by_wall
+                    wall_note = f"под стеной {format_wow_money(wall_price)}"
 
         if target_sell <= buy_price:
             continue
 
-        # 3. Оценка геометрии "воздушного кармана" и вероятности исполнения p_fill
+        z_score = (ref_plateau - buy_price) / r_std
+        disc_plateau_pct = (1.0 - buy_price / ref_plateau) * 100.0
+
+        # 3. Оценка геометрии воздушного кармана и вероятности исполнения p_fill
         if tick.gap_qty > 0 and effective_flow > 0:
             hours_to_clear_gap = tick.gap_qty / max(effective_flow, 1.0)
         else:
             hours_to_clear_gap = 2.0
 
-        # Если перед стеной лежит "бетонная лестница" на >18 часов оборота — режем шанс исполнения
         if hours_to_clear_gap > 18.0:
             continue
 
-        # Считаем оценку вероятности продажи p_fill в выбранном окне
-        p_fill = 0.45
-        p_fill += min(0.18, 0.05 * bounces)
+        p_fill = 0.45 + min(0.18, 0.05 * bounces)
         if clock["has_clock"] and clock["clock_edge_pct"] >= 15.0 and 2 <= clock["hours_to_peak"] <= 14:
-            p_fill += 0.14  # Пиковые часы актива прямо впереди
+            p_fill += 0.14
         elif clock["has_clock"] and (clock["hours_to_peak"] <= 1 or clock["hours_to_peak"] >= 20):
-            p_fill -= 0.10  # Сейчас уже фаза пика актива — опасно заходить на излёте
+            p_fill -= 0.10
         if hours_to_clear_gap <= 3.0:
-            p_fill += 0.08  # Чистый воздушный карман
+            p_fill += 0.08
         elif hours_to_clear_gap >= 8.0:
             p_fill -= 0.12
+        if is_dump_floor_wall:
+            p_fill -= 0.08
         if is_weekend:
             p_fill -= 0.04
         p_fill = max(0.25, min(0.85, p_fill))
@@ -760,11 +772,9 @@ def _score_from_cache(ctx: _SnapshotCache) -> list[dict]:
         dep_24h_risk_pct = (dep_24h / buy_price) * 100.0 if buy_price > 0 else 0.0
 
         peak_within_8h = clock["has_clock"] and 1 <= clock["hours_to_peak"] <= 8
-        # Если пик актива в пределах 8 часов ИЛИ залог > 5% от закупки — ставим 8ч; иначе 24ч
         rec_list_hours = 8 if (dep_24h_risk_pct > 5.0 or peak_within_8h) else 24
         deposit_unit = dep_8h if rec_list_hours == 8 else dep_24h
 
-        # Чистый профит при продаже (депозит возвращается!) и честное матожидание E[PnL] с риском сгорания залога
         net_if_filled = int(target_sell * 0.95) - buy_price
         ev_unit = p_fill * net_if_filled - (1.0 - p_fill) * deposit_unit
         if net_if_filled <= 0 or ev_unit <= 0:
@@ -773,7 +783,6 @@ def _score_from_cache(ctx: _SnapshotCache) -> list[dict]:
         roi_pct = (net_if_filled / buy_price) * 100.0
         ev_roi_pct = (ev_unit / buy_price) * 100.0
 
-        # Пороги входа: при явном окне дна своих часов требования мягче, на излёте пика — жёстче
         in_own_trough_window = clock["has_clock"] and clock["clock_edge_pct"] >= 15.0 and 2 <= clock["hours_to_peak"] <= 14
         min_roi_req = 14.0 if in_own_trough_window else 18.0
         min_ev_roi_req = 8.0 if in_own_trough_window else 11.0
@@ -782,7 +791,7 @@ def _score_from_cache(ctx: _SnapshotCache) -> list[dict]:
         if roi_pct < min_roi_req or ev_roi_pct < min_ev_roi_req or z_score < min_z_req:
             continue
 
-        # 5. Реальный размер пакета (используем cheap_qty, когда он уже собирается)
+        # 5. Реальный размер пакета (по cheap_qty, когда он уже пишется в БД)
         max_by_budget = max_budget_per_item // buy_price
         est_cheap_depth = tick.cheap_qty if tick.cheap_qty > 0 else max(1, total_qty // 4)
         affordable_qty = min(meta.max_stack, max_by_budget, est_cheap_depth)
@@ -794,7 +803,6 @@ def _score_from_cache(ctx: _SnapshotCache) -> list[dict]:
         if total_profit < 1500 or total_ev < 800:
             continue
 
-        # Тегирование
         if in_own_trough_window and bounces >= 2:
             tag = "МАЯТНИК"
         elif tick.gap_qty > 0 and hours_to_clear_gap <= 2.5 and z_score >= 1.5:
@@ -822,22 +830,24 @@ def _score_from_cache(ctx: _SnapshotCache) -> list[dict]:
             reason_parts.append(wall_note)
         reason_str = " • ".join(reason_parts)
 
-        # Скоринг по матожиданию E[PnL] * ликвидность * оборачиваемость * циклы
+        # Мультипликативный скоринг через math.prod (защищён от искажений при копировании)
         depth_mult = math.log1p(num_auctions) / math.log1p(40.0)
         flow_mult = math.log1p(effective_flow) / math.log1p(50.0)
         liquidity_mult = max(0.25, 0.5 * depth_mult + 0.5 * flow_mult)
         turnover_penalty = min(1.0, max(0.35, (effective_flow * 4.0) / max(affordable_qty, 1)))
         cycle_mult = min(1.6, 0.85 + 0.20 * bounces)
         clock_mult = 1.25 if in_own_trough_window else 0.90
+        wall_mult = 0.70 if is_dump_floor_wall else 1.0
 
-        score = (
-            total_ev
-            * liquidity_mult
-            * turnover_penalty
-            * cycle_mult
-            * clock_mult
-            * min(2.2, max(0.8, z_score))
-        )
+        score = math.prod([
+            float(total_ev),
+            liquidity_mult,
+            turnover_penalty,
+            cycle_mult,
+            clock_mult,
+            wall_mult,
+            min(2.2, max(0.8, z_score)),
+        ])
 
         opportunities.append({
             "item_id": iid,
@@ -1227,7 +1237,7 @@ async def build_ai_market_digest() -> str:
         market_snapshot_lines.append(
             f"- {meta.name} (ID:{meta.item_id}) | Вход: {format_wow_money(tick.entry_price)} | "
             f"Стена: {format_wow_money(tick.wall_price)} | "
-            f"Мед(72): {format_wow_money(int(med))} [p75 {format_wow_money(int(p75))} | {format_wow_money(lo)}..{format_wow_money(hi)}] | "
+            f"Мед: {format_wow_money(int(med))} [p75 {format_wow_money(int(p75))} | {format_wow_money(lo)}..{format_wow_money(hi)}] | "
             f"Лотов: {tick.num_auctions} (шт: {tick.quantity}, churn: {churn:.0f}/ч{extra})"
         )
 
@@ -1241,7 +1251,7 @@ async def build_ai_market_digest() -> str:
         )
 
     lines = [
-        f"### СРЕЗ РЫНКА WOW FOREVER EU (PvP Alliance) | Модель {MODEL_VERSION} | Срезов Blizzard: {ctx.runs_count}",
+        f"### СРЕЗ РЫНКА WOW FOREVER EU (PvP Alliance, house_{settings.BNET_HOUSE_ID}) | Модель {MODEL_VERSION} | Чистых срезов: {ctx.runs_count}",
         f"Последний скан Blizzard API (UTC): {snap_ts.isoformat()} ({day_mode})",
         "",
         "#### 1. ТЕКУЩИЕ АКТИВНЫЕ КОЛЛЫ СИСТЕМЫ (ПО E[PnL], ЧАСАМ АКТИВА И ГЕОМЕТРИИ СТАКАНА):",
@@ -1252,6 +1262,11 @@ async def build_ai_market_digest() -> str:
                 f"- [{o['tag']}] {o['name']}: вход <= {format_wow_money(o['buy'])}, цель {format_wow_money(o['sell'])} "
                 f"(ROI +{o['roi']}%, E[ROI] +{o['ev_roi']}%, пакет {o['qty']} шт., E[профит] ~{format_wow_money(o['total_ev'])}) — {o['reason']}"
             )
+    elif ctx.runs_count < MIN_HIST_TICKS_FLIP:
+        lines.append(
+            f"- Идёт прогрев чистой базы house_{settings.BNET_HOUSE_ID}: "
+            f"{ctx.runs_count}/{MIN_HIST_TICKS_FLIP} срезов (коллы откроются автоматически)."
+        )
     else:
         lines.append("- Подтверждённых цикличных перекосов с положительным E[PnL] на текущем срезе нет.")
 
@@ -1312,7 +1327,7 @@ async def build_ai_market_digest() -> str:
         lines.append(
             f"- [{it['tier']}] [{it['status_label']}] {it['name']} (ID:{it['item_id']}) | "
             f"Сейчас: {format_wow_money(it['price'])} (ранг {it['rank_pct']:.0f}%, {-it['disc_med_pct']:+.0f}% к мед.) | "
-            f"Мед(72): {format_wow_money(it['median'])} [{format_wow_money(it['lo'])}..{format_wow_money(it['hi'])}] | "
+            f"Мед: {format_wow_money(it['median'])} [{format_wow_money(it['lo'])}..{format_wow_money(it['hi'])}] | "
             f"Лотов: {it['num_auctions']} (шт: {it['qty']}{sup}{clk})"
         )
 
