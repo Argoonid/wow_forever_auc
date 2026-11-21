@@ -1,5 +1,5 @@
 from datetime import datetime
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, String, Text, func
+from sqlalchemy import JSON, Boolean, Column, DateTime, Float, ForeignKey, Index, Integer, String, Text, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -59,6 +59,11 @@ class MarketTick(Base):
     market_value: Mapped[int] = mapped_column(Integer, default=0)
     quantity: Mapped[int] = mapped_column(Integer, default=0)
     num_auctions: Mapped[int] = mapped_column(Integer, default=0)
+    cheap_qty = Column(Integer, nullable=False, default=0)        # Объём в пределах +5% от entry_price
+    gap_qty = Column(Integer, nullable=False, default=0)          # "Воздушный карман" между входом и стеной
+    book_p25_price = Column(Integer, nullable=False, default=0)   # Цена на 25% накопленного объёма книги
+    est_sold_qty = Column(Integer, nullable=False, default=0)     # Оценка реальных выкупов за последний час
+    est_sold_vwap = Column(Integer, nullable=False, default=0)    # Средневзвешенная цена этих выкупов
 
     __table_args__ = (
         Index("ix_tick_item_season", "item_id", "day_of_week", "hour_of_day"),
@@ -130,3 +135,7 @@ class SignalCallLog(Base):
     max_observed_copper: Mapped[int] = mapped_column(Integer, default=0)
     actual_roi: Mapped[float] = mapped_column(Float, default=0.0)
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    reason = Column(Text, nullable=False, default="")             # Заменить String(128) на Text
+    model_version = Column(String(16), nullable=False, default="v4")
+    metrics = Column(JSON, nullable=True)                         # Или JSONB из sqlalchemy.dialects.postgresql

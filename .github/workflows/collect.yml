@@ -2,7 +2,7 @@ name: WoW Forever AH Collector
 
 on:
   schedule:
-    - cron: '*/30 * * * *'
+    - cron: '27 * * * *'  
   workflow_dispatch:
 
 concurrency:

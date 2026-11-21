@@ -5,7 +5,7 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 import httpx
-from sqlalchemy import desc, or_, select
+from sqlalchemy import or_, select
 from config import settings
 from database import async_session_factory
 from models import ItemMeta, MarketTick
@@ -13,10 +13,11 @@ from models import ItemMeta, MarketTick
 logger = logging.getLogger("source.blizzard")
 
 MIN_AUTO_ADD_PRICE_COPPER = 80
+_DIAG_WATCH_IDS = (7067, 13463, 13464, 13466)
 
 
 class BlizzardForeverSource:
-    """Прямой коннектор к официальному Game Data API Blizzard для WoW: Forever."""
+    """Прямой коннектор к официальному Game Data API Blizzard для WoW: Forever (v4)."""
 
     def __init__(self) -> None:
         self.region = getattr(settings, "BNET_REGION", "eu").strip().lower()
@@ -32,6 +33,12 @@ class BlizzardForeverSource:
         self._last_modified_header: str | None = None
         self._last_snapshot_ts: datetime | None = None
         self._commodity_mode: str = "house_commodities"
+
+        # Память прошлого часа для синтетической ленты сделок: auction_id -> (item_id, unit_price, qty, time_left)
+        self._prev_lots: dict[int, tuple[int, int, int, str]] = {}
+        self._prev_entries: dict[int, int] = {}
+        self._prev_lots_ts: datetime | None = None
+        self._logged_sample_lot: bool = False
 
     async def _get_token(self, client: httpx.AsyncClient, force_refresh: bool = False) -> str:
         now_ts = datetime.now(timezone.utc).timestamp()
@@ -144,13 +151,23 @@ class BlizzardForeverSource:
         async with sem:
             result = {"item_id": item_id, "name": None, "sell_price": None, "max_stack": None, "icon_url": None}
             try:
-                r = await client.get(
-                    f"{self.api_base}/data/wow/item/{item_id}",
-                    params={"namespace": self.static_namespace, "locale": "ru_RU"},
-                    headers=headers,
-                    timeout=15.0,
+                r, rm = await asyncio.gather(
+                    client.get(
+                        f"{self.api_base}/data/wow/item/{item_id}",
+                        params={"namespace": self.static_namespace, "locale": "ru_RU"},
+                        headers=headers,
+                        timeout=15.0,
+                    ),
+                    client.get(
+                        f"{self.api_base}/data/wow/media/item/{item_id}",
+                        params={"namespace": self.static_namespace},
+                        headers=headers,
+                        timeout=15.0,
+                    ),
+                    return_exceptions=True,
                 )
-                if r.status_code == 200:
+
+                if not isinstance(r, Exception) and r.status_code == 200:
                     data = r.json()
                     name = data.get("name")
                     if isinstance(name, dict):
@@ -162,13 +179,7 @@ class BlizzardForeverSource:
                     if data.get("max_count"):
                         result["max_stack"] = int(data["max_count"])
 
-                rm = await client.get(
-                    f"{self.api_base}/data/wow/media/item/{item_id}",
-                    params={"namespace": self.static_namespace},
-                    headers=headers,
-                    timeout=15.0,
-                )
-                if rm.status_code == 200:
+                if not isinstance(rm, Exception) and rm.status_code == 200:
                     for a in rm.json().get("assets") or []:
                         if a.get("key") == "icon" and a.get("value"):
                             # Сохраняем полный URL Blizzard CDN, чтобы работали и кастомные иконки Forever
@@ -236,7 +247,13 @@ class BlizzardForeverSource:
             return await self.resolve_unknown_items(client, token, limit=limit, include_non_http_icons=True)
 
     @staticmethod
-    def _analyze_commodity_book(lots: list[tuple[int, int]]) -> tuple[int, int, int, int, int]:
+    def _analyze_commodity_book(
+        lots: list[tuple[int, int]],
+    ) -> tuple[int, int, int, int, int, int, int, int]:
+        """
+        Разбирает геометрию стакана:
+        (min_buyout, entry_price, wall_price, total_qty, num_auctions, cheap_qty, gap_qty, book_p25_price)
+        """
         lots.sort(key=lambda x: x[0])
         min_buyout = lots[0][0]
         num_auctions = len(lots)
@@ -250,6 +267,7 @@ class BlizzardForeverSource:
             else:
                 levels.append((price, qty))
 
+        # Цена входа (глубина 5 единиц — защита от одиночного байт-лота)
         entry_price = min_buyout
         cum_qty = 0
         target_depth = min(5, max(1, total_qty))
@@ -259,9 +277,90 @@ class BlizzardForeverSource:
                 entry_price = price
                 break
 
-        half_levels = levels[: max(1, len(levels) // 2)]
-        wall_price = max(half_levels, key=lambda x: x[1])[0] if half_levels else entry_price
-        return min_buyout, entry_price, wall_price, total_qty, num_auctions
+        # Цена на 25% накопленного объёма всей книги
+        book_p25_price = entry_price
+        p25_target = max(1, int(total_qty * 0.25))
+        cum_p25 = 0
+        for price, lvl_qty in levels:
+            cum_p25 += lvl_qty
+            if cum_p25 >= p25_target:
+                book_p25_price = price
+                break
+
+        # Стена предложения (крупнейший уровень в нижних 60% ценовых ступеней)
+        lower_levels = levels[: max(1, int(len(levels) * 0.60))]
+        wall_price = max(lower_levels, key=lambda x: x[1])[0] if lower_levels else entry_price
+
+        # Реальная глубина дешёвой полки (<= +5% от входа) и "воздушный карман" до стены
+        cheap_cap = int(entry_price * 1.05)
+        wall_floor = int(wall_price * 0.98)
+        cheap_qty = 0
+        gap_qty = 0
+        for price, lvl_qty in levels:
+            if price <= cheap_cap:
+                cheap_qty += lvl_qty
+            elif wall_price > cheap_cap and price < wall_floor:
+                gap_qty += lvl_qty
+
+        return (
+            min_buyout,
+            entry_price,
+            wall_price,
+            total_qty,
+            num_auctions,
+            cheap_qty,
+            gap_qty,
+            book_p25_price,
+        )
+
+    def _compute_synthetic_tape(
+        self,
+        snapshot_ts: datetime,
+        cur_lots: dict[int, tuple[int, int, int, str]],
+        cur_entries: dict[int, int],
+    ) -> dict[int, tuple[int, int]]:
+        """
+        Синтетическая лента сделок по диффу auction_id + time_left между соседними часами.
+        Возвращает item_id -> (est_sold_qty, est_sold_vwap).
+        """
+        tape: dict[int, tuple[int, int]] = {}
+
+        if (
+            self._prev_lots
+            and self._prev_lots_ts is not None
+            and 0 < (snapshot_ts - self._prev_lots_ts).total_seconds() <= 5400
+        ):
+            sold_qty_acc: dict[int, int] = defaultdict(int)
+            sold_val_acc: dict[int, int] = defaultdict(int)
+
+            for aid, (iid, prev_p, prev_q, prev_tl) in self._prev_lots.items():
+                cur = cur_lots.get(aid)
+                if cur is not None:
+                    # Лот остался, но количество уменьшилось — 100% реальный частичный выкуп
+                    cur_q = cur[2]
+                    if cur_q < prev_q:
+                        dq = prev_q - cur_q
+                        sold_qty_acc[iid] += dq
+                        sold_val_acc[iid] += dq * prev_p
+                else:
+                    # Лот исчез: отбрасываем SHORT/MEDIUM (истечение по таймеру) и завышенные снятия
+                    prev_entry = self._prev_entries.get(iid, 0)
+                    if (
+                        prev_tl in ("LONG", "VERY_LONG")
+                        and prev_entry > 0
+                        and prev_p <= int(prev_entry * 1.25)
+                    ):
+                        sold_qty_acc[iid] += prev_q
+                        sold_val_acc[iid] += prev_q * prev_p
+
+            for iid, sq in sold_qty_acc.items():
+                if sq > 0:
+                    tape[iid] = (sq, int(sold_val_acc[iid] // sq))
+
+        self._prev_lots = cur_lots
+        self._prev_entries = cur_entries
+        self._prev_lots_ts = snapshot_ts
+        return tape
 
     async def fetch_market_snapshot(self) -> tuple[datetime, list[MarketTick]]:
         async with httpx.AsyncClient() as client:
@@ -301,7 +400,13 @@ class BlizzardForeverSource:
             self._last_snapshot_ts = snapshot_ts
             primary_auctions = resp.json().get("auctions") or []
 
+            if primary_auctions and not self._logged_sample_lot:
+                logger.info(f"Blizzard sample lot keys: {list(primary_auctions[0].keys())} | {primary_auctions[0]}")
+                self._logged_sample_lot = True
+
             comm_books: dict[int, list[tuple[int, int]]] = defaultdict(list)
+            cur_lots: dict[int, tuple[int, int, int, str]] = {}
+
             for row in primary_auctions:
                 item_obj = row.get("item") or {}
                 iid = int(item_obj.get("id") or 0)
@@ -313,6 +418,9 @@ class BlizzardForeverSource:
                         unit_p = buyout // qty
                 if iid > 0 and unit_p > 0:
                     comm_books[iid].append((unit_p, qty))
+                    aid = int(row.get("id") or 0)
+                    if aid > 0:
+                        cur_lots[aid] = (iid, unit_p, qty, str(row.get("time_left") or ""))
 
             regular_auctions = []
             if self._commodity_mode != "combined_house" and house_id > 0:
@@ -325,22 +433,13 @@ class BlizzardForeverSource:
                 )
                 if items_resp.status_code == 200:
                     regular_auctions = items_resp.json().get("auctions") or []
+                else:
+                    logger.warning(f"Blizzard regular_auctions HTTP {items_resp.status_code}")
 
             async with async_session_factory() as session:
                 known_meta = {
                     r.item_id: r for r in (await session.execute(select(ItemMeta))).scalars().all()
                 }
-
-                latest_ticks_map: dict[int, int] = {}
-                subq = (
-                    select(MarketTick.item_id, MarketTick.market_value)
-                    .where(MarketTick.market_value > 0)
-                    .order_by(desc(MarketTick.id))
-                    .limit(1000)
-                )
-                for iid, mv in (await session.execute(subq)).all():
-                    if iid not in latest_ticks_map:
-                        latest_ticks_map[iid] = mv
 
                 reg_books: dict[int, list[tuple[int, int]]] = defaultdict(list)
                 for row in regular_auctions:
@@ -351,19 +450,45 @@ class BlizzardForeverSource:
                     buyout = int(row.get("buyout") or 0)
                     qty = max(1, int(row.get("quantity") or 1))
                     if buyout > 0:
-                        reg_books[iid].append((buyout // qty, qty))
+                        unit_p = buyout // qty
+                        reg_books[iid].append((unit_p, qty))
+                        aid = int(row.get("id") or 0)
+                        if aid > 0:
+                            cur_lots[aid] = (iid, unit_p, qty, str(row.get("time_left") or ""))
+
+                # Диагностика пропажи ключевых трав прямо на выходе API
+                missing_diag = [
+                    iid for iid in _DIAG_WATCH_IDS
+                    if iid not in comm_books and iid not in reg_books
+                ]
+                if missing_diag:
+                    logger.warning(
+                        f"Blizzard API raw missing watch IDs: {missing_diag} "
+                        f"(primary={len(primary_auctions)}, regular={len(regular_auctions)}, unique_comm={len(comm_books)})"
+                    )
+
+                all_candidate_ids = set(comm_books.keys()) | set(reg_books.keys())
+                parsed_books: dict[int, tuple[int, int, int, int, int, int, int, int]] = {}
+                cur_entries: dict[int, int] = {}
+
+                for iid in all_candidate_ids:
+                    book = comm_books.get(iid, []) + reg_books.get(iid, [])
+                    if not book:
+                        continue
+                    stats = self._analyze_commodity_book(book)
+                    parsed_books[iid] = stats
+                    cur_entries[iid] = stats[1]
+
+                tape_map = self._compute_synthetic_tape(snapshot_ts, cur_lots, cur_entries)
+                has_v4_cols = hasattr(MarketTick, "cheap_qty")
 
                 ticks: list[MarketTick] = []
                 new_items_added = 0
                 dow = snapshot_ts.weekday()
                 hod = snapshot_ts.hour
 
-                for iid in set(comm_books.keys()) | set(reg_books.keys()):
-                    book = comm_books.get(iid) or reg_books.get(iid) or []
-                    if not book:
-                        continue
-
-                    min_b, entry_p, wall_p, total_q, num_auc = self._analyze_commodity_book(book)
+                for iid, stats in parsed_books.items():
+                    min_b, entry_p, wall_p, total_q, num_auc, cheap_q, gap_q, p25_p = stats
                     meta = known_meta.get(iid)
 
                     if not meta:
@@ -384,22 +509,31 @@ class BlizzardForeverSource:
                     elif meta.velocity_score <= 0:
                         meta.velocity_score = round(max(15.0, min(5000.0, total_q * 0.35)), 1)
 
-                    ref_market = meta.tsm_market_value or latest_ticks_map.get(iid, 0)
-                    ticks.append(
-                        MarketTick(
-                            snapshot_ts=snapshot_ts,
-                            day_of_week=dow,
-                            hour_of_day=hod,
-                            source="blizzard",
-                            item_id=iid,
-                            min_buyout=min_b,
-                            entry_price=entry_p,
-                            wall_price=wall_p,
-                            market_value=ref_market,
-                            quantity=total_q,
-                            num_auctions=num_auc,
-                        )
+                    sold_q, sold_vwap = tape_map.get(iid, (0, 0))
+                    ref_market = meta.tsm_market_value or 0
+
+                    tick_kwargs = dict(
+                        snapshot_ts=snapshot_ts,
+                        day_of_week=dow,
+                        hour_of_day=hod,
+                        source="blizzard",
+                        item_id=iid,
+                        min_buyout=min_b,
+                        entry_price=entry_p,
+                        wall_price=wall_p,
+                        market_value=ref_market,
+                        quantity=total_q,
+                        num_auctions=num_auc,
                     )
+                    if has_v4_cols:
+                        tick_kwargs.update(
+                            cheap_qty=cheap_q,
+                            gap_qty=gap_q,
+                            book_p25_price=p25_p,
+                            est_sold_qty=sold_q,
+                            est_sold_vwap=sold_vwap,
+                        )
+                    ticks.append(MarketTick(**tick_kwargs))
 
                 if new_items_added > 0:
                     await session.commit()
@@ -408,7 +542,8 @@ class BlizzardForeverSource:
                 await self.resolve_unknown_items(client, token, limit=80)
 
         logger.info(
-            f"Blizzard Forever ({self._commodity_mode}, house {self.house_id}): разобрано {len(primary_auctions)} лотов "
-            f"-> {len(ticks)} позиций (новых: {new_items_added})."
+            f"Blizzard Forever v4 ({self._commodity_mode}, house {self.house_id}): "
+            f"разобрано {len(primary_auctions)} лотов -> {len(ticks)} позиций "
+            f"(новых: {new_items_added}, лента сделок: {len(tape_map)} поз.)."
         )
         return snapshot_ts, ticks

@@ -89,8 +89,10 @@ export function normalizeIconName(iconName) {
 
 export function renderIconImg(iconName, cls = 'wow-icon') {
   const safe = normalizeIconName(iconName);
-  return `<img class="${cls}" src="/api/icon/${encodeURIComponent(safe)}.jpg" loading="lazy" decoding="async" alt="" />`;
+  return `<img class="${cls}" src="/api/icon/${encodeURIComponent(safe)}.jpg" loading="lazy" decoding="async" onerror="this.onerror=null;this.src='${QUESTIONMARK_ICON}'" alt="" />`;
 }
+
+
 // Трёхуровневый фолбэк: Wowhead CDN -> Blizzard Render CDN -> вопросительный знак
 window.__iconFallback = function (img) {
   const step = Number(img.dataset.fbStep || '0');
