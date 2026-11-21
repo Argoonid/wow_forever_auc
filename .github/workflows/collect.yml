@@ -33,4 +33,5 @@ jobs:
           BNET_RULESET_ID: 1
           BNET_HOUSE_ID: ${{ secrets.BNET_HOUSE_ID }}
           MARKET_DATABASE_URL: ${{ secrets.MARKET_DATABASE_URL }}
+          ANALYZER_MIN_SNAPSHOT_ID: 81
         run: python collect_once.py

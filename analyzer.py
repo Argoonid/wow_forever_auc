@@ -129,6 +129,16 @@ def _is_market_read_only() -> bool:
     return os.getenv("MARKET_READ_ONLY", "").strip().lower() in {"1", "true", "yes"}
 
 
+def _min_snapshot_id() -> int:
+    val = getattr(settings, "ANALYZER_MIN_SNAPSHOT_ID", None)
+    if val is None:
+        val = os.getenv("ANALYZER_MIN_SNAPSHOT_ID", "0")
+    try:
+        return max(0, int(val))
+    except (TypeError, ValueError):
+        return 0
+
+
 def format_wow_money(copper: int) -> str:
     sign = "-" if copper < 0 else ""
     c = abs(int(copper))
@@ -253,7 +263,7 @@ def _analyze_price_regime(
     Режимный фильтр v4 на последних 72ч чистых тиков Blizzard:
     1. Убивает долгий структурный спад (умирающие лоу-лвл ресурсы).
     2. Убивает падающий нож (последние 6ч против предыдущих 12ч).
-    3. Ограничивает цель реальным 2-часовым удержанным потолком за последние 24 тика (стирает старые призраки и 1ч-шпили).
+    3. Ограничивает цель реальным 2-часовым удержанным потолком за последние 24 тика.
     4. Подтверждает наличие свежего цикла возврата (маятника).
     """
     recent_series = series[-REGIME_WINDOW_TICKS:]
@@ -364,6 +374,10 @@ async def _load_snapshot_context(snapshot_id: int | None = None, force_reload: b
                 if not target_run:
                     return None
 
+            min_snap_id = _min_snapshot_id()
+            if min_snap_id > 0 and target_run.id < min_snap_id:
+                return None
+
             if not force_reload and target_run.id == _cache.snapshot_id:
                 _cache.checked_at = now_mono
                 return _cache
@@ -371,12 +385,13 @@ async def _load_snapshot_context(snapshot_id: int | None = None, force_reload: b
             raw_snap_ts = target_run.snapshot_ts
             snap_ts_utc = raw_snap_ts if raw_snap_ts.tzinfo else raw_snap_ts.replace(tzinfo=timezone.utc)
 
-            # Считаем именно чистые срезы Blizzard
+            # Считаем именно чистые срезы Blizzard начиная с отсечки house_110
             runs_count = int(
                 (
                     await session.execute(
                         select(func.count(func.distinct(MarketTick.snapshot_id))).where(
-                            MarketTick.source == "blizzard"
+                            MarketTick.source == "blizzard",
+                            MarketTick.snapshot_id >= min_snap_id,
                         )
                     )
                 ).scalar()
@@ -460,12 +475,15 @@ async def _load_snapshot_context(snapshot_id: int | None = None, force_reload: b
                     est_sold_vwap=int(row[12] or 0) if has_v4_cols else 0,
                 )
 
-            # История СТРОГО source='blizzard' и СТРОГО до текущего среза
+            # История СТРОГО source='blizzard', до текущего среза и не раньше отсечки house_110
             hist_run_ids = list(
                 (
                     await session.execute(
                         select(SnapshotRun.id)
-                        .where(SnapshotRun.snapshot_ts < raw_snap_ts)
+                        .where(
+                            SnapshotRun.snapshot_ts < raw_snap_ts,
+                            SnapshotRun.id >= min_snap_id,
+                        )
                         .order_by(desc(SnapshotRun.snapshot_ts))
                         .limit(HIST_WINDOW_SNAPSHOTS)
                     )
@@ -517,8 +535,9 @@ async def _load_snapshot_context(snapshot_id: int | None = None, force_reload: b
             _cache.raid_radar_cache = None
 
             logger.info(
-                "Кэш анализатора v4 прогрет: snapshot_id=%d, blizzard_snaps=%d, позиций=%d",
+                "Кэш анализатора v4 прогрет: snapshot_id=%d (min=%d), blizzard_snaps=%d, позиций=%d",
                 target_run.id,
+                min_snap_id,
                 runs_count,
                 len(latest_ticks),
             )
@@ -541,6 +560,7 @@ async def refresh_call_outcomes(session) -> None:
 
     raw_min_ts = min(c.called_at for c in pending_calls)
     pending_item_ids = {c.item_id for c in pending_calls}
+    min_snap_id = _min_snapshot_id()
 
     vendor_map = {
         int(iid): int(vp or 0)
@@ -560,6 +580,7 @@ async def refresh_call_outcomes(session) -> None:
                 MarketTick.num_auctions,
             ).where(
                 MarketTick.source == "blizzard",
+                MarketTick.snapshot_id >= min_snap_id,
                 MarketTick.item_id.in_(pending_item_ids),
                 MarketTick.snapshot_ts > raw_min_ts,
                 MarketTick.entry_price > 0,
@@ -708,7 +729,6 @@ def _score_from_cache(ctx: _SnapshotCache) -> list[dict]:
             continue
 
         # 3. Оценка геометрии "воздушного кармана" и вероятности исполнения p_fill
-        # Сколько часов реального оборота потребуется, чтобы рынок проел карман до нашей цели
         if tick.gap_qty > 0 and effective_flow > 0:
             hours_to_clear_gap = tick.gap_qty / max(effective_flow, 1.0)
         else:
