@@ -144,13 +144,12 @@ class SignalCallLog(Base):
     actual_roi: Mapped[float] = mapped_column(Float, default=0.0)
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
-    class CollectorState(Base):
-        """Одиночное сжатое состояние лотов прошлого часа для синтетической ленты сделок (cron / GitHub Actions)."""
-        __tablename__ = "collector_state"
-    
-        state_key: Mapped[str] = mapped_column(String(64), primary_key=True)
-        snapshot_ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-        payload: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
-        updated_at: Mapped[datetime] = mapped_column(
-            DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
-        )
+class CollectorState(Base):
+    """Одиночное сжатое состояние лотов прошлого часа для синтетической ленты сделок (cron / GitHub Actions)."""
+    __tablename__ = "collector_state"
+    state_key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    snapshot_ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    payload: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
