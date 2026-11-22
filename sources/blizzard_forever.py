@@ -1,6 +1,8 @@
 import asyncio
+import json
 import logging
 import re
+import zlib
 from collections import defaultdict
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -8,16 +10,17 @@ import httpx
 from sqlalchemy import or_, select
 from config import settings
 from database import async_session_factory
-from models import ItemMeta, MarketTick
+from models import CollectorState, ItemMeta, MarketTick
 
 logger = logging.getLogger("source.blizzard")
 
 MIN_AUTO_ADD_PRICE_COPPER = 80
 _DIAG_WATCH_IDS = (7067, 13463, 13464, 13466)
+_TL_PACK = {"SHORT": "S", "MEDIUM": "M", "LONG": "L", "VERY_LONG": "V"}
 
 
 class BlizzardForeverSource:
-    """Прямой коннектор к официальному Game Data API Blizzard для WoW: Forever (v4)."""
+    """Прямой коннектор к официальному Game Data API Blizzard для WoW: Forever (v4 + persistent tape)."""
 
     def __init__(self) -> None:
         self.region = getattr(settings, "BNET_REGION", "eu").strip().lower()
@@ -39,6 +42,90 @@ class BlizzardForeverSource:
         self._prev_entries: dict[int, int] = {}
         self._prev_lots_ts: datetime | None = None
         self._logged_sample_lot: bool = False
+
+    def _tape_state_key(self) -> str:
+        return f"blizz_lots_r{self.ruleset_id}_h{self.house_id}"
+
+    async def _load_tape_state(self) -> None:
+        """Подгружает лоты прошлого часа из Neon при холодном старте (GitHub Actions / перезапуск)."""
+        if self._prev_lots_ts is not None:
+            return
+        try:
+            async with async_session_factory() as session:
+                row = await session.get(CollectorState, self._tape_state_key())
+                if not row or not row.payload:
+                    return
+                raw = json.loads(zlib.decompress(row.payload).decode("utf-8"))
+                ts = row.snapshot_ts if row.snapshot_ts.tzinfo else row.snapshot_ts.replace(tzinfo=timezone.utc)
+                self._prev_lots_ts = ts
+                self._prev_entries = {int(k): int(v) for k, v in (raw.get("e") or {}).items()}
+                self._prev_lots = {
+                    int(aid): (int(iid), int(p), int(q), str(tl))
+                    for aid, iid, p, q, tl in (raw.get("l") or [])
+                }
+                logger.info(
+                    "Лента сделок: загружено состояние прошлого часа из Neon (%s, лотов: %d).",
+                    ts.isoformat(),
+                    len(self._prev_lots),
+                )
+        except Exception as exc:
+            logger.warning("Не удалось загрузить collector_state (работаем без ленты на этом шаге): %s", exc)
+
+    async def _save_tape_state(
+        self,
+        snapshot_ts: datetime,
+        cur_lots: dict[int, tuple[int, int, int, str]],
+        cur_entries: dict[int, int],
+        keep_item_ids: set[int],
+    ) -> None:
+        """Сохраняет компактный сжатый срез лотов текущего часа поверх одной строки в Neon."""
+        if bool(getattr(settings, "MARKET_READ_ONLY", False)):
+            return
+        try:
+            compact_lots = []
+            compact_entries: dict[str, int] = {}
+            for iid in keep_item_ids:
+                ep = cur_entries.get(iid, 0)
+                if ep > 0:
+                    compact_entries[str(iid)] = ep
+
+            for aid, (iid, unit_p, qty, tl) in cur_lots.items():
+                if iid not in keep_item_ids:
+                    continue
+                ep = cur_entries.get(iid, 0)
+                # Отсекаем тролль-лоты дороже x2 от входа — реальных выкупов там нет
+                if ep > 0 and unit_p > ep * 2:
+                    continue
+                compact_lots.append([aid, iid, unit_p, qty, _TL_PACK.get(tl, tl[:1])])
+
+            blob = zlib.compress(
+                json.dumps({"e": compact_entries, "l": compact_lots}, separators=(",", ":")).encode("utf-8"),
+                level=6,
+            )
+            state_key = self._tape_state_key()
+            async with async_session_factory() as session:
+                row = await session.get(CollectorState, state_key)
+                if row is None:
+                    session.add(
+                        CollectorState(
+                            state_key=state_key,
+                            snapshot_ts=snapshot_ts,
+                            payload=blob,
+                        )
+                    )
+                else:
+                    row.snapshot_ts = snapshot_ts
+                    row.payload = blob
+                    row.updated_at = datetime.now(timezone.utc)
+                await session.commit()
+            logger.info(
+                "Лента сделок: сохранено состояние %s (%d лотов, %.1f КБ в Neon).",
+                state_key,
+                len(compact_lots),
+                len(blob) / 1024.0,
+            )
+        except Exception as exc:
+            logger.warning("Не удалось сохранить collector_state: %s", exc)
 
     async def _get_token(self, client: httpx.AsyncClient, force_refresh: bool = False) -> str:
         now_ts = datetime.now(timezone.utc).timestamp()
@@ -182,7 +269,6 @@ class BlizzardForeverSource:
                 if not isinstance(rm, Exception) and rm.status_code == 200:
                     for a in rm.json().get("assets") or []:
                         if a.get("key") == "icon" and a.get("value"):
-                            # Сохраняем полный URL Blizzard CDN, чтобы работали и кастомные иконки Forever
                             result["icon_url"] = str(a["value"])
                             break
             except Exception:
@@ -267,7 +353,6 @@ class BlizzardForeverSource:
             else:
                 levels.append((price, qty))
 
-        # Цена входа (глубина 5 единиц — защита от одиночного байт-лота)
         entry_price = min_buyout
         cum_qty = 0
         target_depth = min(5, max(1, total_qty))
@@ -277,7 +362,6 @@ class BlizzardForeverSource:
                 entry_price = price
                 break
 
-        # Цена на 25% накопленного объёма всей книги
         book_p25_price = entry_price
         p25_target = max(1, int(total_qty * 0.25))
         cum_p25 = 0
@@ -287,11 +371,9 @@ class BlizzardForeverSource:
                 book_p25_price = price
                 break
 
-        # Стена предложения (крупнейший уровень в нижних 60% ценовых ступеней)
         lower_levels = levels[: max(1, int(len(levels) * 0.60))]
         wall_price = max(lower_levels, key=lambda x: x[1])[0] if lower_levels else entry_price
 
-        # Реальная глубина дешёвой полки (<= +5% от входа) и "воздушный карман" до стены
         cheap_cap = int(entry_price * 1.05)
         wall_floor = int(wall_price * 0.98)
         cheap_qty = 0
@@ -318,12 +400,13 @@ class BlizzardForeverSource:
         snapshot_ts: datetime,
         cur_lots: dict[int, tuple[int, int, int, str]],
         cur_entries: dict[int, int],
-    ) -> dict[int, tuple[int, int]]:
+    ) -> tuple[dict[int, tuple[int, int]], bool]:
         """
         Синтетическая лента сделок по диффу auction_id + time_left между соседними часами.
-        Возвращает item_id -> (est_sold_qty, est_sold_vwap).
+        Возвращает (tape_map, is_newer_snapshot).
         """
         tape: dict[int, tuple[int, int]] = {}
+        is_newer = self._prev_lots_ts is None or snapshot_ts > self._prev_lots_ts
 
         if (
             self._prev_lots
@@ -336,17 +419,15 @@ class BlizzardForeverSource:
             for aid, (iid, prev_p, prev_q, prev_tl) in self._prev_lots.items():
                 cur = cur_lots.get(aid)
                 if cur is not None:
-                    # Лот остался, но количество уменьшилось — 100% реальный частичный выкуп
                     cur_q = cur[2]
                     if cur_q < prev_q:
                         dq = prev_q - cur_q
                         sold_qty_acc[iid] += dq
                         sold_val_acc[iid] += dq * prev_p
                 else:
-                    # Лот исчез: отбрасываем SHORT/MEDIUM (истечение по таймеру) и завышенные снятия
                     prev_entry = self._prev_entries.get(iid, 0)
                     if (
-                        prev_tl in ("LONG", "VERY_LONG")
+                        prev_tl in ("LONG", "VERY_LONG", "L", "V")
                         and prev_entry > 0
                         and prev_p <= int(prev_entry * 1.25)
                     ):
@@ -357,10 +438,12 @@ class BlizzardForeverSource:
                 if sq > 0:
                     tape[iid] = (sq, int(sold_val_acc[iid] // sq))
 
-        self._prev_lots = cur_lots
-        self._prev_entries = cur_entries
-        self._prev_lots_ts = snapshot_ts
-        return tape
+        if is_newer:
+            self._prev_lots = cur_lots
+            self._prev_entries = cur_entries
+            self._prev_lots_ts = snapshot_ts
+
+        return tape, is_newer
 
     async def fetch_market_snapshot(self) -> tuple[datetime, list[MarketTick]]:
         async with httpx.AsyncClient() as client:
@@ -436,6 +519,8 @@ class BlizzardForeverSource:
                 else:
                     logger.warning(f"Blizzard regular_auctions HTTP {items_resp.status_code}")
 
+            await self._load_tape_state()
+
             async with async_session_factory() as session:
                 known_meta = {
                     r.item_id: r for r in (await session.execute(select(ItemMeta))).scalars().all()
@@ -456,7 +541,6 @@ class BlizzardForeverSource:
                         if aid > 0:
                             cur_lots[aid] = (iid, unit_p, qty, str(row.get("time_left") or ""))
 
-                # Диагностика пропажи ключевых трав прямо на выходе API
                 missing_diag = [
                     iid for iid in _DIAG_WATCH_IDS
                     if iid not in comm_books and iid not in reg_books
@@ -479,7 +563,7 @@ class BlizzardForeverSource:
                     parsed_books[iid] = stats
                     cur_entries[iid] = stats[1]
 
-                tape_map = self._compute_synthetic_tape(snapshot_ts, cur_lots, cur_entries)
+                tape_map, is_newer_snap = self._compute_synthetic_tape(snapshot_ts, cur_lots, cur_entries)
                 has_v4_cols = hasattr(MarketTick, "cheap_qty")
 
                 ticks: list[MarketTick] = []
@@ -492,7 +576,6 @@ class BlizzardForeverSource:
                     meta = known_meta.get(iid)
 
                     if not meta:
-                        # Жёстко отсекаем мусор дешевле 80 меди и неликвид
                         if entry_p < MIN_AUTO_ADD_PRICE_COPPER or (total_q < 40 and num_auc < 5):
                             continue
                         est_velocity = round(max(25.0, min(5000.0, total_q * 0.35)), 1)
@@ -535,8 +618,12 @@ class BlizzardForeverSource:
                         )
                     ticks.append(MarketTick(**tick_kwargs))
 
+                keep_ids = set(known_meta.keys())
                 if new_items_added > 0:
                     await session.commit()
+
+            if is_newer_snap and cur_lots:
+                await self._save_tape_state(snapshot_ts, cur_lots, cur_entries, keep_ids)
 
             if new_items_added > 0:
                 await self.resolve_unknown_items(client, token, limit=80)

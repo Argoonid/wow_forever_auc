@@ -1,7 +1,8 @@
 from datetime import datetime
 from typing import Any
-from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Index, Integer, String, Text, func
+from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Index, Integer, LargeBinary, String, Text, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
 
 
 class Base(DeclarativeBase):
@@ -142,3 +143,14 @@ class SignalCallLog(Base):
     max_observed_copper: Mapped[int] = mapped_column(Integer, default=0)
     actual_roi: Mapped[float] = mapped_column(Float, default=0.0)
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    class CollectorState(Base):
+        """Одиночное сжатое состояние лотов прошлого часа для синтетической ленты сделок (cron / GitHub Actions)."""
+        __tablename__ = "collector_state"
+    
+        state_key: Mapped[str] = mapped_column(String(64), primary_key=True)
+        snapshot_ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+        payload: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+        updated_at: Mapped[datetime] = mapped_column(
+            DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+        )

@@ -103,10 +103,11 @@ class _SnapshotCache:
     snapshot_id: int = -1
     snap_ts: datetime | None = None
     runs_count: int = 0
+    tape_active: bool = False
     checked_at: float = 0.0
     items_map: dict[int, _MetaLite] = field(default_factory=dict)
     latest_ticks: dict[int, _TickLite] = field(default_factory=dict)
-    # item_id -> [(entry_price, qty, num_auctions, hour_of_day, day_of_week, est_sold_qty), ...]
+    # item_id -> [(entry_price, qty, num_auctions, hour_of_day, day_of_week, est_sold_qty_or_-1), ...]
     hist_by_item: dict[int, list[tuple[int, int, int, int, int, int]]] = field(default_factory=dict)
     scored_cache_key: tuple[int, float, float] | None = None
     scored_ops: list[dict] = field(default_factory=list)
@@ -261,7 +262,7 @@ def _analyze_price_regime(
 ) -> dict:
     """
     Режимный фильтр v4 на последних 72ч чистых тиков house_110:
-    убивает умирающие тренды, падающие ножи и разовые всплески; требует подтверждённый цикл.
+    убивает умирающие тренды, падающие ножи и разовые всплески; требует минимум 2 цикла.
     """
     recent_series = series[-REGIME_WINDOW_TICKS:]
     prices = [x[0] for x in recent_series]
@@ -309,7 +310,7 @@ def _analyze_price_regime(
     if recent_low <= 0 or ref_plateau <= recent_low * 1.12:
         return {"tradable": False, "reason": "flat_recent_24h"}
 
-    # 3. Счётчик подтверждённых циклов возврата (общий + минимум 1 свежий за последние 30 тиков)
+    # 3. Счётчик подтверждённых циклов возврата (всегда >= 2 + минимум 1 свежий за последние 30 тиков)
     low_thr = recent_low * 1.08
     high_thr = ref_plateau * 0.93
 
@@ -326,7 +327,7 @@ def _analyze_price_regime(
 
     bounces = _count_bounces(prices)
     recent_bounces = _count_bounces(prices[-30:] if n >= 30 else prices)
-    min_bounces = 2 if n >= 28 else 1
+    min_bounces = 2
     if bounces < min_bounces or recent_bounces < 1:
         return {"tradable": False, "reason": f"no_fresh_pattern({bounces}/{recent_bounces})"}
 
@@ -483,6 +484,8 @@ async def _load_snapshot_context(snapshot_id: int | None = None, force_reload: b
                     est_sold_vwap=int(row[12] or 0) if has_v4_cols else 0,
                 )
 
+            latest_tape_active = any(t.est_sold_qty > 0 for t in latest_ticks.values())
+
             # История строго по монотонному id: >= min_snap_id и строго < target_run.id
             hist_run_ids = list(
                 (
@@ -509,7 +512,7 @@ async def _load_snapshot_context(snapshot_id: int | None = None, force_reload: b
                     MarketTick.day_of_week,
                 ]
                 if has_v4_cols:
-                    h_cols.append(MarketTick.est_sold_qty)
+                    h_cols.extend([MarketTick.est_sold_qty, MarketTick.snapshot_id])
 
                 h_rows = (
                     await session.execute(
@@ -523,10 +526,20 @@ async def _load_snapshot_context(snapshot_id: int | None = None, force_reload: b
                     )
                 ).all()
 
+                # Определяем срезы, на которых синтетическая лента реально работала (чтобы отличать 0 продаж от отсутствия ленты)
+                tape_snap_ids = (
+                    {int(row[7]) for row in h_rows if int(row[6] or 0) > 0}
+                    if has_v4_cols
+                    else set()
+                )
+
                 for row in h_rows:
                     iid_int = int(row[0])
                     if iid_int in latest_ticks or iid_int in _RAID_WATCH_ID_SET:
-                        sold_q = int(row[6] or 0) if has_v4_cols else 0
+                        if has_v4_cols and int(row[7]) in tape_snap_ids:
+                            sold_q = int(row[6] or 0)
+                        else:
+                            sold_q = -1
                         hist_by_item[iid_int].append(
                             (int(row[1]), int(row[2] or 0), int(row[3] or 0), int(row[4] or 0), int(row[5] or 0), sold_q)
                         )
@@ -534,6 +547,7 @@ async def _load_snapshot_context(snapshot_id: int | None = None, force_reload: b
             _cache.snapshot_id = target_run.id
             _cache.snap_ts = snap_ts_utc
             _cache.runs_count = runs_count
+            _cache.tape_active = latest_tape_active
             _cache.checked_at = now_mono
             _cache.items_map = items_map
             _cache.latest_ticks = latest_ticks
@@ -543,11 +557,12 @@ async def _load_snapshot_context(snapshot_id: int | None = None, force_reload: b
             _cache.raid_radar_cache = None
 
             logger.info(
-                "Кэш анализатора v4 прогрет: snapshot_id=%d (min=%d), blizzard_snaps=%d, позиций=%d",
+                "Кэш анализатора v4 прогрет: snapshot_id=%d (min=%d), blizzard_snaps=%d, позиций=%d, лента=%s",
                 target_run.id,
                 min_snap_id,
                 runs_count,
                 len(latest_ticks),
+                "ON" if latest_tape_active else "OFF",
             )
             return _cache
 
@@ -651,8 +666,8 @@ async def refresh_call_outcomes(session) -> None:
 def _score_from_cache(ctx: _SnapshotCache) -> list[dict]:
     """
     Скоринг v4:
-    Персональные часы актива, защита от покупки выше медианы, оценка воздушного кармана
-    и выбор слота (8ч/24ч) через честное матожидание E[PnL] с учётом риска залога.
+    Персональные часы актива, защита от покупки выше медианы, честная оценка воздушного кармана,
+    синтетическая лента сделок и выбор слота (8ч/24ч) через матожидание E[PnL].
     """
     bankroll_gold = float(settings.BANKROLL_GOLD)
     max_share = float(settings.MAX_SHARE_PER_ITEM)
@@ -692,10 +707,13 @@ def _score_from_cache(ctx: _SnapshotCache) -> list[dict]:
         local_prices = [x[0] for x in recent_slice]
         local_qtys = [x[1] for x in recent_slice]
         local_aucs = [x[2] for x in recent_slice]
-        local_sold = [x[5] for x in recent_slice if x[5] > 0]
+
+        tape_samples = [x[5] for x in recent_slice if x[5] >= 0]
+        if ctx.tape_active:
+            tape_samples.append(tick.est_sold_qty)
 
         qty_churn = _compute_qty_churn(local_qtys)
-        avg_sold_hr = (sum(local_sold) / len(local_sold)) if local_sold else 0.0
+        avg_sold_hr = (sum(tape_samples) / len(tape_samples)) if tape_samples else 0.0
         effective_flow = max(avg_sold_hr, qty_churn)
         median_aucs = _percentile(sorted(local_aucs), 0.50) if local_aucs else float(num_auctions)
 
@@ -742,10 +760,16 @@ def _score_from_cache(ctx: _SnapshotCache) -> list[dict]:
         disc_plateau_pct = (1.0 - buy_price / ref_plateau) * 100.0
 
         # 3. Оценка геометрии воздушного кармана и вероятности исполнения p_fill
-        if tick.gap_qty > 0 and effective_flow > 0:
+        if is_dump_floor_wall:
+            hours_to_clear_gap = 5.0
+        elif tick.gap_qty > 0 and effective_flow > 0:
             hours_to_clear_gap = tick.gap_qty / max(effective_flow, 1.0)
+        elif tick.cheap_qty > 0 and wall_price > int(buy_price * 1.05):
+            # v4-данные собраны и между дешёвой полкой и стеной реально пусто — чистый воздушный карман
+            hours_to_clear_gap = 0.5
         else:
-            hours_to_clear_gap = 2.0
+            # Нет данных геометрии: нейтральное значение (без искусственного бонуса +8%)
+            hours_to_clear_gap = 5.0
 
         if hours_to_clear_gap > 18.0:
             continue
@@ -805,7 +829,7 @@ def _score_from_cache(ctx: _SnapshotCache) -> list[dict]:
 
         if in_own_trough_window and bounces >= 2:
             tag = "МАЯТНИК"
-        elif tick.gap_qty > 0 and hours_to_clear_gap <= 2.5 and z_score >= 1.5:
+        elif tick.cheap_qty > 0 and not is_dump_floor_wall and hours_to_clear_gap <= 2.5 and z_score >= 1.5:
             tag = "КАРМАН"
         elif z_score >= 2.0 and disc_plateau_pct >= 22.0:
             tag = "СИЛЬНОЕ ДНО"
@@ -822,6 +846,8 @@ def _score_from_cache(ctx: _SnapshotCache) -> list[dict]:
             reason_parts.append(f"пик ~{clock['peak_hour']:02d} UTC (+{clock['clock_edge_pct']:.0f}%)")
         if tick.gap_qty > 0:
             reason_parts.append(f"карман {tick.gap_qty}шт")
+        elif tick.cheap_qty > 0 and not is_dump_floor_wall and wall_price > int(buy_price * 1.05):
+            reason_parts.append("чистый карман")
         if avg_sold_hr >= 1.0:
             reason_parts.append(f"выкуп ~{avg_sold_hr:.0f}/ч")
         else:
