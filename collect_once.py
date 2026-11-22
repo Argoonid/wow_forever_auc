@@ -2,7 +2,7 @@ import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 from sqlalchemy import delete, desc, select
-from analyzer import evaluate_opportunities
+from analyzer import RAID_WATCHLIST_IDS, evaluate_opportunities
 from config import STARTER_ACTIVE_POOL, settings
 from database import async_session_factory, init_market_db, market_engine
 from models import ItemMeta, MarketTick, SnapshotRun
@@ -12,6 +12,8 @@ from sources.blizzard_forever import BlizzardForeverSource
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)-7s | %(name)-12s | %(message)s")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger("collect_once")
+
+RAID_WATCH_ID_SET: set[int] = {iid for iid, _ in RAID_WATCHLIST_IDS}
 
 
 async def prune_old_ticks() -> None:
@@ -48,7 +50,7 @@ async def run_once() -> None:
             return
 
         prev_run = (
-            await session.execute(select(SnapshotRun).order_by(desc(SnapshotRun.snapshot_ts)).limit(1))
+            await session.execute(select(SnapshotRun).order_by(desc(SnapshotRun.id)).limit(1))
         ).scalar_one_or_none()
 
         gap_minutes = None
@@ -60,16 +62,21 @@ async def run_once() -> None:
             gap_minutes = round((snapshot_ts - prev_ts).total_seconds() / 60.0, 1)
             is_continuous = gap_minutes <= settings.MAX_CONTINUOUS_GAP_MINUTES
 
+        # Теневой пул сортируем по числу лотов и денежной глубине, а не по сырому quantity
         top_shadow_ids = {
             t.item_id
-            for t in sorted(ticks, key=lambda x: (getattr(x, "sold_per_day", 0.0), x.quantity), reverse=True)[
-                : settings.SHADOW_POOL_LIMIT
-            ]
+            for t in sorted(
+                ticks,
+                key=lambda x: (int(x.num_auctions or 0), int(x.entry_price or 0) * int(x.quantity or 0)),
+                reverse=True,
+            )[: settings.SHADOW_POOL_LIMIT]
         }
         known_items = {row.item_id: row for row in (await session.execute(select(ItemMeta))).scalars().all()}
-        active_ids = set(STARTER_ACTIVE_POOL.keys()) | {
-            iid for iid, m in known_items.items() if m.is_active_pool
-        }
+        active_ids = (
+            set(STARTER_ACTIVE_POOL.keys())
+            | RAID_WATCH_ID_SET
+            | {iid for iid, m in known_items.items() if m.is_active_pool}
+        )
         tracked_ids = active_ids | top_shadow_ids
 
         run = SnapshotRun(
@@ -82,39 +89,52 @@ async def run_once() -> None:
         session.add(run)
         await session.flush()
 
+        has_v4_cols = hasattr(MarketTick, "cheap_qty")
         db_ticks = []
         for t in ticks:
             if t.item_id not in tracked_ids:
                 continue
+
             meta = known_items.get(t.item_id)
             if not meta:
                 starter = STARTER_ACTIVE_POOL.get(t.item_id)
+                is_pinned = bool(starter) or (t.item_id in RAID_WATCH_ID_SET)
                 meta = ItemMeta(
                     item_id=t.item_id,
                     name=starter["name"] if starter else f"Item_{t.item_id}",
-                    category=starter["category"] if starter else "shadow",
+                    category=starter["category"] if starter else ("raid" if t.item_id in RAID_WATCH_ID_SET else "shadow"),
                     max_stack=starter["stack"] if starter else 20,
-                    is_active_pool=bool(starter),
+                    is_active_pool=is_pinned,
                 )
                 session.add(meta)
                 known_items[t.item_id] = meta
+            elif t.item_id in RAID_WATCH_ID_SET and not meta.is_active_pool:
+                meta.is_active_pool = True
 
-            db_ticks.append(
-                MarketTick(
-                    snapshot_id=run.id,
-                    snapshot_ts=snapshot_ts,
-                    day_of_week=snapshot_ts.weekday(),
-                    hour_of_day=snapshot_ts.hour,
-                    source=source_name,
-                    item_id=t.item_id,
-                    min_buyout=t.min_buyout,
-                    entry_price=t.entry_price,
-                    wall_price=t.wall_price,
-                    market_value=t.market_value,
-                    quantity=t.quantity,
-                    num_auctions=t.num_auctions,
-                )
+            tick_kwargs = dict(
+                snapshot_id=run.id,
+                snapshot_ts=snapshot_ts,
+                day_of_week=snapshot_ts.weekday(),
+                hour_of_day=snapshot_ts.hour,
+                source=source_name,
+                item_id=t.item_id,
+                min_buyout=t.min_buyout,
+                entry_price=t.entry_price,
+                wall_price=t.wall_price,
+                market_value=t.market_value,
+                quantity=t.quantity,
+                num_auctions=t.num_auctions,
             )
+            if has_v4_cols:
+                tick_kwargs.update(
+                    cheap_qty=int(getattr(t, "cheap_qty", 0) or 0),
+                    gap_qty=int(getattr(t, "gap_qty", 0) or 0),
+                    book_p25_price=int(getattr(t, "book_p25_price", 0) or 0),
+                    est_sold_qty=int(getattr(t, "est_sold_qty", 0) or 0),
+                    est_sold_vwap=int(getattr(t, "est_sold_vwap", 0) or 0),
+                )
+
+            db_ticks.append(MarketTick(**tick_kwargs))
 
         run.tracked_items_count = len(db_ticks)
         session.add_all(db_ticks)
